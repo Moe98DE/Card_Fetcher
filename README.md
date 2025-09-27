@@ -19,7 +19,7 @@ To run this application, you will need Python 3 installed on your system.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/mtg-deck-formatter.git
+    git clone https://github.com/Moe98DE/Card_Fetcher.git
     cd mtg-deck-formatter
     ```
 

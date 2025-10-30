@@ -1,18 +1,21 @@
 # formatter.py
 import textwrap
-from typing import List
+from typing import List, Optional
 from models import Card
 
 # ----- Tweakables -----
-WIDTH = 72                  # overall report width
-LEFT_COL = 50               # width for the left side (name, fields)
-WRAP_WIDTH = WIDTH - 4      # paragraph width inside sections (with indent)
-SECT_RULE = "─" * WIDTH     # main section rule
-CARD_RULE = "─" * WIDTH     # per-card rule
+WIDTH = 72
+WRAP_WIDTH = WIDTH - 4
+SECT_RULE = "─" * WIDTH
+CARD_SEPARATOR = "·" * (WIDTH - 8)
 MELD_RULE = "─" * (WIDTH - 2)
+
+
+# ... (all other helper functions like _rule, _center, etc. remain the same) ...
 
 def _rule(char="─", width=WIDTH) -> str:
     return char * width
+
 
 def _center(title: str, pad_char=" ") -> str:
     title = f" {title.strip()} "
@@ -20,6 +23,7 @@ def _center(title: str, pad_char=" ") -> str:
         return title[:WIDTH]
     side = (WIDTH - len(title)) // 2
     return f"{pad_char * side}{title}{pad_char * (WIDTH - len(title) - side)}"
+
 
 def _wrap(text: str, initial_indent: str = "  ", subsequent_indent: str = "  ") -> str:
     wrapper = textwrap.TextWrapper(width=WRAP_WIDTH,
@@ -29,164 +33,156 @@ def _wrap(text: str, initial_indent: str = "  ", subsequent_indent: str = "  ") 
                                    break_on_hyphens=False)
     return wrapper.fill(text)
 
+
 def _safe(val, default="") -> str:
     return default if val is None else str(val)
+
 
 def _format_colors(colors: List[str]) -> str:
     return ", ".join(colors) if colors else "Colorless"
 
+
 def _format_mana_cost(face) -> str:
-    # mana_cost may be None or empty; show nothing rather than "()"
     mc = (face.mana_cost or "").strip()
     return mc
+
 
 def _face_title(i: int, faces: List) -> str:
     if len(faces) <= 1:
         return ""
     return "Front Face" if i == 0 else "Back Face"
 
+
+def _should_display_colors(card: Card) -> bool:
+    if not card.card_faces: return True
+    first_face = card.card_faces[0]
+    if not card.colors: return True
+    if not first_face.mana_cost and card.colors: return True
+    if first_face.oracle_text and "Devoid" in first_face.oracle_text: return True
+    return False
+
+
+# ----- NEW HELPER FUNCTION TO FIX THE BUG -----
+def _is_meld_card(card: Card) -> bool:
+    """
+    Checks if a card is part of a meld mechanic specifically.
+    The `all_parts` field is used for transform, adventures, etc., so we must
+    check the component type.
+    """
+    if not card.all_parts:
+        return False
+
+    meld_components = {"meld_part", "meld_result"}
+    return any(part.get("component") in meld_components for part in card.all_parts)
+
+
+# -----------------------------------------------
+
 def _format_face(face, faces_len: int, face_index: int) -> List[str]:
     lines: List[str] = []
-    title = _face_title(face_index, [None] * faces_len)
-    if face.name:
+    if faces_len > 1:
+        title = _face_title(face_index, [None] * faces_len)
         label = face.name if not title else f"{face.name} ({title})"
-        lines.append(f"// --- {label} --- //")
-
-    if face.type_line:
-        lines.append(f"Type: {face.type_line}")
-
+        lines.append("")
+        lines.append(_center(label, "-"))
     if face.power is not None and face.toughness is not None:
-        lines.append(f"P/T: {face.power}/{face.toughness}")
+        lines.append(f"  P/T: {face.power}/{face.toughness}")
     if face.loyalty is not None:
-        lines.append(f"Loyalty: {face.loyalty}")
-
+        lines.append(f"  Loyalty: {face.loyalty}")
     if face.oracle_text:
-        lines.append("")  # spacing
+        if not (face.power is not None or face.loyalty is not None):
+            lines.append("")
         lines.append("Text:")
-
         bullet_prefixes = ("•", "-", "–")
-        # break into lines; Scryfall often uses bullets inline or one per line
         for raw_line in face.oracle_text.split("\n"):
             stripped = raw_line.strip()
-            if not stripped:
-                continue
+            if not stripped: continue
             if stripped.startswith(bullet_prefixes):
-                # hanging indent for bullets
                 bullet_wrap = textwrap.TextWrapper(
-                    width=WRAP_WIDTH,
-                    initial_indent="    " + stripped[0] + " ",
-                    subsequent_indent="      ",
-                    break_long_words=False,
-                    break_on_hyphens=False,
+                    width=WRAP_WIDTH, initial_indent="    " + stripped[0] + " ",
+                    subsequent_indent="      ", break_long_words=False, break_on_hyphens=False
                 )
-                # remove the first bullet character before wrapping
                 lines.append(bullet_wrap.fill(stripped[1:].lstrip()))
             else:
-                # normal wrapped text
                 lines.append(_wrap(stripped))
     return lines
 
 
-# replace _format_meld_box with this
 def _format_meld_section(card: Card) -> List[str]:
     lines: List[str] = []
     lines.append("~ Meld Information ~")
-
-    # Is this the meld RESULT?
-    is_result = any(p["component"] == "meld_result" and p["name"] == card.name
-                    for p in card.all_parts)
-
+    is_result = any(p["component"] == "meld_result" and p["name"] == card.name for p in card.all_parts)
     if is_result:
         parts = [p["name"] for p in card.all_parts if p["component"] == "meld_part"]
         lines.append("  This is the result of melding:")
-        for p in parts:
-            lines.append(f"    • {p}")
+        for p in parts: lines.append(f"    • {p}")
     else:
-        # This is a meld PART
         try:
-            partner = next(p["name"] for p in card.all_parts
-                           if p["component"] == "meld_part" and p["name"] != card.name)
-            result_name = next(p["name"] for p in card.all_parts
-                               if p["component"] == "meld_result")
+            partner = next(
+                p["name"] for p in card.all_parts if p["component"] == "meld_part" and p["name"] != card.name)
+            result_name = next(p["name"] for p in card.all_parts if p["component"] == "meld_result")
             lines.append(f"  Melds with: {partner}")
             lines.append(f"  To become:  {result_name}")
         except StopIteration:
             lines.append("  Meld data is incomplete.")
-
-    # If we have the full result card, show it exactly once (no extra header here).
     if getattr(card, "meld_result_card", None):
-        lines.append("")  # spacing
-        lines.extend(_format_card_details(card.meld_result_card, is_sub_card=True))
-
+        lines.append("")
+        lines.extend(_format_card_block(card.meld_result_card, is_sub_card=True))
     return lines
 
-def _format_card_header(card: Card) -> str:
-    """
-    LEFT:  '{qty}x {name}'
-    RIGHT: mana cost for first face (or blank)
-    Next row (right aligned): Colors: <...>
-    """
-    qty_name = f"{card.quantity}x {card.name}"
+
+def _format_card_header(card: Card) -> List[str]:
+    lines: List[str] = []
     first_face = card.card_faces[0] if card.card_faces else None
-    mana_cost = _format_mana_cost(first_face) if first_face else ""
-    left = qty_name[:LEFT_COL]
-    right = f"{mana_cost}".rjust(WIDTH - LEFT_COL)
-    return f"{left}{right}"
+    if not first_face: return []
+    qty_name = f"{card.quantity}x {card.name}"
+    mana_cost = _format_mana_cost(first_face)
+    lines.append(f"{qty_name}{mana_cost.rjust(WIDTH - len(qty_name))}")
+    type_line = f"  {first_face.type_line or ''}"
+    if _should_display_colors(card):
+        color_str = f"Colors: {_format_colors(card.colors)}"
+        lines.append(f"{type_line}{color_str.rjust(WIDTH - len(type_line))}")
+    else:
+        lines.append(type_line)
+    return lines
 
-def _format_card_meta_right(colors: List[str]) -> str:
-    color_str = _format_colors(colors)
-    return f"  Colors: {color_str}"
 
-def _format_card_details(card: Card, is_sub_card: bool = False) -> List[str]:
-    """Helper to format a single Card object into a list of lines."""
+def _format_card_block(card: Card, is_sub_card: bool = False) -> List[str]:
     out: List[str] = []
-
-    # Sub-card header (for meld result display inside the box)
     if is_sub_card:
-        out.append(_center(card.name))
-        out.append(CARD_RULE)
-
-    # Colors line (right-aligned on the card block)
-    out.append(_format_card_meta_right(card.colors))
-
-    # Per-face details
+        out.append(MELD_RULE)
+        out.extend(_format_card_header(card))
+    else:
+        out.extend(_format_card_header(card))
     for i, face in enumerate(card.card_faces):
         out.extend(_format_face(face, faces_len=len(card.card_faces), face_index=i))
-
     return out
 
+
 def format_deck_as_text(deck: List[Card]) -> str:
-    """Formats a list of Card objects into a clean, aligned report."""
     output: List[str] = []
     total_cards = sum(card.quantity for card in deck)
-
-    # Deck header
     output.append(SECT_RULE)
     output.append(_center("MTG DECKLIST REPORT"))
     output.append(_center(f"Total Cards: {total_cards}   •   Unique Cards: {len(deck)}"))
     output.append(SECT_RULE)
     output.append("")
-
     for idx, card in enumerate(deck, start=1):
-        # Card header
-        output.append(_format_card_header(card))
-        output.append(CARD_RULE)
+        if idx > 1:
+            output.append("")
+            output.append(_center(CARD_SEPARATOR))
+            output.append("")
 
-        # Main card details
-        output.extend(_format_card_details(card))
+        output.extend(_format_card_block(card))
 
-        # Meld box (if present)
-        if card.all_parts:
-            output.append("")  # spacing
+        # ----- FIX APPLIED HERE -----
+        # Now we check specifically for meld components.
+        if _is_meld_card(card):
+            output.append("")
             output.extend(_format_meld_section(card))
+        # ----------------------------
 
-        # Card footer spacing
-        output.append("")
-        output.append(SECT_RULE)
-        output.append("")
-
-    # Trim trailing newlines
-    while output and output[-1].strip() == "":
+    while output and not output[-1].strip():
         output.pop()
-
+    output.append("")
     return "\n".join(output)

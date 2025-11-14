@@ -11,7 +11,7 @@ CARD_SEPARATOR = "·" * (WIDTH - 8)
 MELD_RULE = "─" * (WIDTH - 2)
 
 
-# ... (all other helper functions like _rule, _center, etc. remain the same) ...
+# ... (all other helper functions remain the same) ...
 def _rule(char="─", width=WIDTH) -> str:
     return char * width
 
@@ -122,7 +122,7 @@ def _format_meld_section(card: Card) -> List[str]:
     return lines
 
 
-# --- MODIFIED: This function is updated to include the price ---
+# --- MODIFIED: This function is updated to include rarity ---
 def _format_card_header(card: Card) -> List[str]:
     lines: List[str] = []
     first_face = card.card_faces[0] if card.card_faces else None
@@ -133,10 +133,16 @@ def _format_card_header(card: Card) -> List[str]:
     mana_cost = _format_mana_cost(first_face)
     lines.append(f"{qty_name}{mana_cost.rjust(WIDTH - len(qty_name))}")
 
-    # Line 2: Type Line (left) and Colors/Price (right)
-    type_line = f"  {first_face.type_line or ''}"
+    # Line 2: Type Line, Rarity, Colors, and Price
 
-    # Build the right-side string dynamically
+    # Build the left-side string (Type and Rarity)
+    # Using .title() to make "common" -> "Common", "rare" -> "Rare", etc.
+    type_line_str = first_face.type_line or ''
+    if card.rarity:
+        type_line_str = f"{type_line_str} - {card.rarity.title()}"
+    type_line = f"  {type_line_str}"
+
+    # Build the right-side string (Colors and Price)
     right_side_info = []
     if _should_display_colors(card):
         right_side_info.append(f"Colors: {_format_colors(card.colors)}")

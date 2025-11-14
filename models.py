@@ -22,7 +22,8 @@ class Card:
     name: str
     colors: List[str]
     quantity: int
-    price_usd: Optional[str] = None  # --- NEW: Field to store the card's price in USD ---
+    price_usd: Optional[str] = None
+    rarity: Optional[str] = None  # --- NEW: Field to store the card's rarity ---
     card_faces: List[CardFace] = field(default_factory=list)
     all_parts: Optional[List[Dict]] = None
     meld_result_card: Optional['Card'] = None
@@ -67,8 +68,9 @@ class Card:
             name=scryfall_data.get('name', 'N/A'),
             colors=scryfall_data.get('colors', []),
             quantity=quantity,
-            # Using .get() safely handles cases where price data might be missing.
             price_usd=scryfall_data.get('prices', {}).get('eur', None),
+            # --- NEW: Extract the rarity from the top-level object ---
+            rarity=scryfall_data.get('rarity', None),
             card_faces=faces,
             all_parts=scryfall_data.get('all_parts', None)
         )

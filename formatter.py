@@ -12,7 +12,6 @@ MELD_RULE = "─" * (WIDTH - 2)
 
 
 # ... (all other helper functions like _rule, _center, etc. remain the same) ...
-
 def _rule(char="─", width=WIDTH) -> str:
     return char * width
 
@@ -62,21 +61,13 @@ def _should_display_colors(card: Card) -> bool:
     return False
 
 
-# ----- NEW HELPER FUNCTION TO FIX THE BUG -----
 def _is_meld_card(card: Card) -> bool:
-    """
-    Checks if a card is part of a meld mechanic specifically.
-    The `all_parts` field is used for transform, adventures, etc., so we must
-    check the component type.
-    """
     if not card.all_parts:
         return False
 
     meld_components = {"meld_part", "meld_result"}
     return any(part.get("component") in meld_components for part in card.all_parts)
 
-
-# -----------------------------------------------
 
 def _format_face(face, faces_len: int, face_index: int) -> List[str]:
     lines: List[str] = []
@@ -131,20 +122,38 @@ def _format_meld_section(card: Card) -> List[str]:
     return lines
 
 
+# --- MODIFIED: This function is updated to include the price ---
 def _format_card_header(card: Card) -> List[str]:
     lines: List[str] = []
     first_face = card.card_faces[0] if card.card_faces else None
     if not first_face: return []
+
+    # Line 1: Quantity, Name, and Mana Cost
     qty_name = f"{card.quantity}x {card.name}"
     mana_cost = _format_mana_cost(first_face)
     lines.append(f"{qty_name}{mana_cost.rjust(WIDTH - len(qty_name))}")
+
+    # Line 2: Type Line (left) and Colors/Price (right)
     type_line = f"  {first_face.type_line or ''}"
+
+    # Build the right-side string dynamically
+    right_side_info = []
     if _should_display_colors(card):
-        color_str = f"Colors: {_format_colors(card.colors)}"
-        lines.append(f"{type_line}{color_str.rjust(WIDTH - len(type_line))}")
+        right_side_info.append(f"Colors: {_format_colors(card.colors)}")
+    if card.price_usd:
+        right_side_info.append(f"Price: €{card.price_usd}")
+
+    right_str = "   •   ".join(right_side_info)
+
+    if right_str:
+        lines.append(f"{type_line}{right_str.rjust(WIDTH - len(type_line))}")
     else:
         lines.append(type_line)
+
     return lines
+
+
+# -----------------------------------------------------------------
 
 
 def _format_card_block(card: Card, is_sub_card: bool = False) -> List[str]:
@@ -175,12 +184,9 @@ def format_deck_as_text(deck: List[Card]) -> str:
 
         output.extend(_format_card_block(card))
 
-        # ----- FIX APPLIED HERE -----
-        # Now we check specifically for meld components.
         if _is_meld_card(card):
             output.append("")
             output.extend(_format_meld_section(card))
-        # ----------------------------
 
     while output and not output[-1].strip():
         output.pop()

@@ -6,16 +6,13 @@ on:
   # Run it when you push to the 'main' or 'master' branch
   push:
     branches: [ "main", "master" ]
-  
-  # Allows you to run this workflow manually from the Actions tab on GitHub
 
+  # Allows you to run this workflow manually from the Actions tab on GitHub
   workflow_dispatch:
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   build:
-    # This is the key part: the 'matrix' strategy runs this job multiple times
-    # with different configurations. We define three OS configurations.
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -33,7 +30,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10' # You can change this to match your Python version
+          python-version: '3.10'
 
       # Step 3: Install project dependencies
       - name: Install dependencies
@@ -41,16 +38,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller requests
 
-      # Step 4: Build the application using PyInstaller with OS-specific commands
-      - name: Build with PyInstaller
-        run: |
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            pyinstaller --onefile --windowed --name MtgDeckFormatter main_gui.py
-          elif [ "${{ runner.os }}" == "macOS" ]; then
-            pyinstaller --windowed --name MtgDeckFormatter main_gui.py
-          else
-            pyinstaller --onefile --name MtgDeckFormatter main_gui.py
-          fi
+      # Step 4.1: Build for Windows
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --windowed --name MtgDeckFormatter main_gui.py
+
+      # Step 4.2: Build for macOS
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller --windowed --name MtgDeckFormatter main_gui.py
+
+      # Step 4.3: Build for Linux
+      - name: Build with PyInstaller (Linux)
+        if: runner.os == 'Linux'
+        run: pyinstaller --onefile --name MtgDeckFormatter main_gui.py
 
       # Step 5: Upload the built executable as a downloadable artifact
       - name: Upload Artifact

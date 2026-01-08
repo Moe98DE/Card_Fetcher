@@ -2,29 +2,61 @@
 import sqlite3
 import json
 import os
+import platform
+import sys
 
-DB_FILE = "scryfall_cache.db"
+def get_app_data_path():
+    """
+    Returns a cross-platform path to store the database.
+    Windows: %APPDATA%\MtgDeckFormatter\
+    macOS: ~/Library/Application Support/MtgDeckFormatter/
+    Linux: ~/.local/share/MtgDeckFormatter/
+    """
+    app_name = "MtgDeckFormatter"
+    
+    if platform.system() == "Windows":
+        base_path = os.getenv('APPDATA')
+    elif platform.system() == "Darwin": # macOS
+        base_path = os.path.expanduser("~/Library/Application Support")
+    else: # Linux/Unix
+        base_path = os.path.expanduser("~/.local/share")
 
+    # Fallback for Linux or weird environments
+    if not base_path:
+        base_path = os.path.expanduser("~")
+
+    # Construct full path
+    full_path = os.path.join(base_path, app_name)
+    
+    # Ensure the directory exists
+    try:
+        os.makedirs(full_path, exist_ok=True)
+    except OSError:
+        # Absolute fallback if we can't write to system folders: use a temp folder
+        import tempfile
+        full_path = os.path.join(tempfile.gettempdir(), app_name)
+        os.makedirs(full_path, exist_ok=True)
+
+    return os.path.join(full_path, "scryfall_cache.db")
+
+# Use the dynamic path instead of a relative string
+DB_FILE = get_app_data_path()
 
 class CardDatabase:
     def __init__(self):
+        # We also need to ensure the directory exists before connecting, 
+        # though get_app_data_path handles creation, it's safe to call.
         self.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
         self.create_table()
 
     def create_table(self):
         cursor = self.conn.cursor()
-        # We store the normalized name (lowercase) for lookups, and the full JSON blob
         cursor.execute('''
-                       CREATE TABLE IF NOT EXISTS cards
-                       (
-                           name_normalized
-                           TEXT
-                           PRIMARY
-                           KEY,
-                           data
-                           TEXT
-                       )
-                       ''')
+            CREATE TABLE IF NOT EXISTS cards (
+                name_normalized TEXT PRIMARY KEY,
+                data TEXT
+            )
+        ''')
         self.conn.commit()
 
     def get_card(self, card_name: str):

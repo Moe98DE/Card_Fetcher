@@ -70,6 +70,7 @@ def _is_meld_card(card: Card) -> bool:
 
 
 def _format_face(face, faces_len: int, face_index: int) -> List[str]:
+    # (Existing code remains exactly the same)
     lines: List[str] = []
     if faces_len > 1:
         title = _face_title(face_index, [None] * faces_len)
@@ -99,7 +100,7 @@ def _format_face(face, faces_len: int, face_index: int) -> List[str]:
     return lines
 
 
-def _format_meld_section(card: Card) -> List[str]:
+def _format_meld_section(card: Card, show_price: bool, show_rarity: bool) -> List[str]:
     lines: List[str] = []
     lines.append("~ Meld Information ~")
     is_result = any(p["component"] == "meld_result" and p["name"] == card.name for p in card.all_parts)
@@ -118,12 +119,12 @@ def _format_meld_section(card: Card) -> List[str]:
             lines.append("  Meld data is incomplete.")
     if getattr(card, "meld_result_card", None):
         lines.append("")
-        lines.extend(_format_card_block(card.meld_result_card, is_sub_card=True))
+        # Pass flags recursively
+        lines.extend(_format_card_block(card.meld_result_card, is_sub_card=True, show_price=show_price, show_rarity=show_rarity))
     return lines
 
 
-# --- MODIFIED: This function is updated to include rarity ---
-def _format_card_header(card: Card) -> List[str]:
+def _format_card_header(card: Card, show_price: bool, show_rarity: bool) -> List[str]:
     lines: List[str] = []
     first_face = card.card_faces[0] if card.card_faces else None
     if not first_face: return []
@@ -136,9 +137,10 @@ def _format_card_header(card: Card) -> List[str]:
     # Line 2: Type Line, Rarity, Colors, and Price
 
     # Build the left-side string (Type and Rarity)
-    # Using .title() to make "common" -> "Common", "rare" -> "Rare", etc.
     type_line_str = first_face.type_line or ''
-    if card.rarity:
+
+    # CHECK RARITY FLAG
+    if show_rarity and card.rarity:
         type_line_str = f"{type_line_str} - {card.rarity.title()}"
     type_line = f"  {type_line_str}"
 
@@ -146,7 +148,9 @@ def _format_card_header(card: Card) -> List[str]:
     right_side_info = []
     if _should_display_colors(card):
         right_side_info.append(f"Colors: {_format_colors(card.colors)}")
-    if card.price_usd:
+
+    # CHECK PRICE FLAG
+    if show_price and card.price_usd:
         right_side_info.append(f"Price: €{card.price_usd}")
 
     right_str = "   •   ".join(right_side_info)
@@ -159,22 +163,18 @@ def _format_card_header(card: Card) -> List[str]:
     return lines
 
 
-# -----------------------------------------------------------------
-
-
-def _format_card_block(card: Card, is_sub_card: bool = False) -> List[str]:
+def _format_card_block(card: Card, is_sub_card: bool = False, show_price: bool = True, show_rarity: bool = True) -> List[str]:
     out: List[str] = []
     if is_sub_card:
         out.append(MELD_RULE)
-        out.extend(_format_card_header(card))
+        out.extend(_format_card_header(card, show_price, show_rarity))
     else:
-        out.extend(_format_card_header(card))
+        out.extend(_format_card_header(card, show_price, show_rarity))
     for i, face in enumerate(card.card_faces):
         out.extend(_format_face(face, faces_len=len(card.card_faces), face_index=i))
     return out
 
-
-def format_deck_as_text(deck: List[Card]) -> str:
+def format_deck_as_text(deck: List[Card], show_price: bool = True, show_rarity: bool = True) -> str:
     output: List[str] = []
     total_cards = sum(card.quantity for card in deck)
     output.append(SECT_RULE)
@@ -188,11 +188,11 @@ def format_deck_as_text(deck: List[Card]) -> str:
             output.append(_center(CARD_SEPARATOR))
             output.append("")
 
-        output.extend(_format_card_block(card))
+        output.extend(_format_card_block(card, show_price=show_price, show_rarity=show_rarity))
 
         if _is_meld_card(card):
             output.append("")
-            output.extend(_format_meld_section(card))
+            output.extend(_format_meld_section(card, show_price=show_price, show_rarity=show_rarity))
 
     while output and not output[-1].strip():
         output.pop()

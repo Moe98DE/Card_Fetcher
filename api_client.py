@@ -53,32 +53,39 @@ def fetch_bulk_data_url() -> Optional[str]:
 
 
 def download_bulk_json(download_url: str, progress_callback=None) -> Optional[List[Dict]]:
-    """
-    Downloads the huge JSON file.
-    """
     try:
         with requests.get(download_url, stream=True) as r:
             r.raise_for_status()
-
-            # Try to get size, default to 0 if missing
             total_length = int(r.headers.get('content-length', 0))
-
+            
             downloaded = 0
             chunks = []
-
+            
+            # Helper to throttle updates
+            last_reported_percent = -1
+            
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     chunks.append(chunk)
                     downloaded += len(chunk)
+                    
                     if progress_callback:
-                        progress_callback(downloaded, total_length)
+                        # Only callback if we have a total_length
+                        if total_length > 0:
+                            current_percent = int((downloaded / total_length) * 100)
+                            # Only update if the integer percentage changed (0, 1, 2...)
+                            if current_percent > last_reported_percent:
+                                progress_callback(downloaded, total_length)
+                                last_reported_percent = current_percent
+                        else:
+                            # If no total length, throttle by size (e.g., every 1MB)
+                            # 1024 * 1024 = 1MB
+                            if downloaded % (1024 * 1024) < 8192: 
+                                progress_callback(downloaded, total_length)
 
-            # Combine chunks
             full_content = b"".join(chunks)
-
-            # --- FIX: Parse the bytes we just downloaded, instead of asking requests to do it
             return json.loads(full_content)
-
+            
     except Exception as e:
         print(f"Error downloading bulk file: {e}")
         return None

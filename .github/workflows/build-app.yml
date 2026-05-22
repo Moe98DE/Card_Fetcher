@@ -38,17 +38,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller requests
 
-      # Step 4.1: Build for Windows
-      - name: Build with PyInstaller (Windows)
+      # Step 4.1: Build normal Windows GUI executable
+      - name: Build with PyInstaller (Windows GUI)
         if: runner.os == 'Windows'
         run: pyinstaller --onefile --windowed --name MtgDeckFormatter main_gui.py
 
-      # Step 4.2: Build for macOS
+      # Step 4.2: Build Windows debug executable with console output
+      - name: Build with PyInstaller (Windows Debug Console)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --console --log-level DEBUG --name MtgDeckFormatter-debug main_gui.py
+
+      # Step 4.3: Build for macOS
       - name: Build with PyInstaller (macOS)
         if: runner.os == 'macOS'
         run: pyinstaller --windowed --name MtgDeckFormatter main_gui.py
 
-      # Step 4.3: Build for Linux
+      # Step 4.4: Build for Linux
       - name: Build with PyInstaller (Linux)
         if: runner.os == 'Linux'
         run: pyinstaller --onefile --name MtgDeckFormatter main_gui.py
@@ -59,9 +64,11 @@ jobs:
         with:
           # Name of the artifact. We make it dynamic based on the OS.
           name: MtgDeckFormatter-${{ runner.os }}
+
           # Path to the file(s) to upload.
-          # We use wildcards to grab the correct output for each OS.
+          # Windows includes both the normal GUI exe and the debug console exe.
           path: |
             dist/MtgDeckFormatter.exe
+            dist/MtgDeckFormatter-debug.exe
             dist/MtgDeckFormatter.app/
             dist/MtgDeckFormatter

@@ -42,12 +42,12 @@ jobs:
       # Step 4.1: Build normal Windows GUI executable
       - name: Build with PyInstaller (Windows GUI)
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --windowed --name MtgDeckFormatter main_gui.py
+        run: pyinstaller --onefile --windowed --collect-all certifi --name MtgDeckFormatter main_gui.py
 
       # Step 4.2: Build Windows debug executable with console output
       - name: Build with PyInstaller (Windows Debug Console)
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --console --log-level DEBUG --name MtgDeckFormatter-debug main_gui.py
+        run: pyinstaller --onefile --console --log-level DEBUG --collect-all certifi --name MtgDeckFormatter-debug main_gui.py
 
       # Step 4.3: Build for macOS
       - name: Build with PyInstaller (macOS)

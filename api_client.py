@@ -3,12 +3,21 @@ import json
 import os
 import time
 from typing import Dict, Optional, List
+import gzip
+import tempfile
 
 import certifi
 import requests
 
 SCRYFALL_API_BASE = "https://api.scryfall.com"
 REQUEST_TIMEOUT = 30
+
+SCRYFALL_HEADERS = {
+    "User-Agent":
+        "Card_Fetcher/1.0 "
+    ,
+    "Accept": "application/json",
+}
 
 # Default to certifi's CA bundle, but allow the user to override it from PowerShell:
 #
@@ -19,20 +28,10 @@ SSL_CERT_FILE = os.environ.get("REQUESTS_CA_BUNDLE", certifi.where())
 
 
 def _get_request_kwargs() -> Dict:
-    """
-    Shared request settings for all API calls.
-
-    Using a function makes it easy to print/debug or change settings later.
-    """
     return {
         "timeout": REQUEST_TIMEOUT,
         "verify": SSL_CERT_FILE,
-        "headers": {
-            # Scryfall asks clients to identify themselves politely.
-            # You can replace the URL/email with your own project info if you want.
-            "User-Agent": "MtgDeckFormatter/1.0",
-            "Accept": "application/json",
-        },
+        "headers": SCRYFALL_HEADERS.copy(),
     }
 
 
@@ -70,7 +69,9 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
         response = requests.get(
             url,
             params=params,
-            **_get_request_kwargs()
+            headers=SCRYFALL_HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            verify=SSL_CERT_FILE,
         )
         response.raise_for_status()
         return response.json()
@@ -98,79 +99,157 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
 
 def fetch_bulk_data_url() -> Optional[str]:
     """
-    Queries Scryfall to get the download URL for 'Default Cards' (includes prices/images).
+    Gets the Default Cards bulk download URL from Scryfall.
+
+    Scryfall currently provides gzip-compressed JSON Lines using
+    jsonl_download_uri. download_uri is retained as a fallback for
+    older API responses.
     """
     try:
         response = requests.get(
             f"{SCRYFALL_API_BASE}/bulk-data",
-            **_get_request_kwargs()
+            **_get_request_kwargs(),
         )
         response.raise_for_status()
         data = response.json()
 
-        # We look for the "default_cards" type
         for item in data.get("data", []):
-            if item.get("type") == "default_cards":
-                return item.get("download_uri")
+            if item.get("type") != "default_cards":
+                continue
+
+            download_url = (
+                item.get("jsonl_download_uri")
+                or item.get("download_uri")
+            )
+
+            if not download_url:
+                print(
+                    "The default_cards entry contained neither "
+                    "jsonl_download_uri nor download_uri."
+                )
+
+            return download_url
 
         print("Could not find 'default_cards' in Scryfall bulk data response.")
         return None
 
     except requests.exceptions.SSLError as err:
-        print("SSL Error fetching bulk data meta.")
+        print("SSL Error fetching bulk data metadata.")
         _print_ssl_help(err)
         return None
 
+    except requests.exceptions.HTTPError as err:
+        response = err.response
+        body = response.text[:1000] if response is not None else ""
+        print(f"HTTP Error fetching bulk data metadata: {err}")
+        if body:
+            print(f"Scryfall response: {body}")
+        return None
+
     except requests.exceptions.RequestException as err:
-        print(f"Request Error fetching bulk data meta: {err}")
+        print(f"Request Error fetching bulk data metadata: {err}")
         return None
 
-    except Exception as err:
-        print(f"Unexpected error fetching bulk data meta: {err}")
+    except (ValueError, TypeError) as err:
+        print(f"Invalid bulk data metadata response: {err}")
         return None
 
+def download_bulk_json(
+    download_url: str,
+    progress_callback=None,
+) -> Optional[List[Dict]]:
+    """
+    Downloads Scryfall bulk data.
 
-def download_bulk_json(download_url: str, progress_callback=None) -> Optional[List[Dict]]:
+    Supports:
+    - Current gzip-compressed JSON Lines files (.jsonl.gz)
+    - Legacy JSON-array downloads
     """
-    Downloads the Scryfall bulk JSON file and returns it as a list of dictionaries.
-    """
+    temp_path = None
+
     try:
         with requests.get(
             download_url,
             stream=True,
-            **_get_request_kwargs()
+            **_get_request_kwargs(),
         ) as response:
             response.raise_for_status()
 
             total_length = int(response.headers.get("content-length", 0))
             downloaded = 0
-            chunks = []
-
-            # Helper to throttle progress updates
             last_reported_percent = -1
 
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".scryfall-bulk",
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
 
-                chunks.append(chunk)
-                downloaded += len(chunk)
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
 
-                if progress_callback:
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+
+                    if not progress_callback:
+                        continue
+
                     if total_length > 0:
-                        current_percent = int((downloaded / total_length) * 100)
+                        current_percent = int(
+                            downloaded * 100 / total_length
+                        )
 
-                        # Only update if the integer percentage changed: 0, 1, 2...
                         if current_percent > last_reported_percent:
                             progress_callback(downloaded, total_length)
                             last_reported_percent = current_percent
                     else:
-                        # If no total length, update roughly every 1MB
-                        if downloaded % (1024 * 1024) < 8192:
-                            progress_callback(downloaded, total_length)
+                        progress_callback(downloaded, 0)
 
-            full_content = b"".join(chunks)
-            return json.loads(full_content)
+        # Detect gzip using the file signature rather than relying only
+        # on the filename or HTTP headers.
+        with open(temp_path, "rb") as downloaded_file:
+            is_gzip = downloaded_file.read(2) == b"\x1f\x8b"
+
+        if is_gzip:
+            cards = []
+
+            with gzip.open(
+                temp_path,
+                mode="rt",
+                encoding="utf-8",
+            ) as jsonl_file:
+                for line_number, line in enumerate(jsonl_file, start=1):
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    try:
+                        card = json.loads(line)
+                    except json.JSONDecodeError as err:
+                        raise ValueError(
+                            f"Invalid JSON on bulk-data line "
+                            f"{line_number}: {err}"
+                        ) from err
+
+                    if isinstance(card, dict):
+                        cards.append(card)
+
+            return cards
+
+        # Compatibility with the previous uncompressed JSON-array format.
+        with open(temp_path, mode="r", encoding="utf-8") as json_file:
+            data = json.load(json_file)
+
+        if not isinstance(data, list):
+            raise ValueError(
+                "Expected the legacy Scryfall bulk file to contain "
+                "a JSON array."
+            )
+
+        return data
 
     except requests.exceptions.SSLError as err:
         print("SSL Error downloading bulk file.")
@@ -181,10 +260,17 @@ def download_bulk_json(download_url: str, progress_callback=None) -> Optional[Li
         print(f"Request Error downloading bulk file: {err}")
         return None
 
-    except json.JSONDecodeError as err:
-        print(f"Error parsing downloaded bulk JSON: {err}")
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        print(f"Error processing downloaded bulk data: {err}")
         return None
 
     except Exception as err:
         print(f"Unexpected error downloading bulk file: {err}")
         return None
+
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass

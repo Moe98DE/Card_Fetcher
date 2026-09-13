@@ -86,7 +86,7 @@ class Card:
             name=scryfall_data.get('name', 'N/A'),
             colors=scryfall_data.get('colors', []),
             quantity=quantity,
-            price_usd=scryfall_data.get('prices', {}).get('eur'),
+            price_usd=scryfall_data.get('_cheapest_normal_paper_eur', scryfall_data.get('prices', {}).get('eur')),
             rarity=scryfall_data.get('rarity'),
             layout=scryfall_data.get('layout', 'normal'),
             card_faces=faces,

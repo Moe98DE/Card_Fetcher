@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional, List
 import gzip
 import tempfile
@@ -18,6 +19,11 @@ SCRYFALL_HEADERS = {
     ,
     "Accept": "application/json",
 }
+
+# Internal marker added to cached Scryfall objects.  Its presence also lets the
+# database distinguish newly-priced rows from older cache rows created before
+# cheapest-print pricing was implemented.
+CHEAPEST_EUR_PRICE_KEY = "_cheapest_normal_paper_eur"
 
 # Default to certifi's CA bundle, but allow the user to override it from PowerShell:
 #
@@ -56,9 +62,83 @@ def _print_ssl_help(error: Exception) -> None:
     print(r"   .\MtgDeckFormatter-debug.exe")
 
 
+def _normal_paper_eur_price(card_data: Dict) -> Optional[str]:
+    """
+    Return this printing's regular (nonfoil) EUR price when it represents a
+    physical paper card.
+
+    Scryfall's ``prices.eur`` field is specifically the regular/nonfoil EUR
+    price.  Foil and etched prices live in separate fields, so they are not
+    considered here.
+    """
+    games = card_data.get("games") or []
+    if "paper" not in games:
+        return None
+
+    if card_data.get("digital") or card_data.get("oversized"):
+        return None
+
+    price = (card_data.get("prices") or {}).get("eur")
+    if price in (None, ""):
+        return None
+
+    try:
+        Decimal(str(price))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+    return str(price)
+
+
+def _fetch_cheapest_normal_paper_eur(card_data: Dict) -> Optional[str]:
+    """Find the cheapest regular paper EUR price across all printings."""
+    prints_url = card_data.get("prints_search_uri")
+
+    # If Scryfall ever omits the prints URI, the resolved printing is still a
+    # useful fallback rather than losing a valid price entirely.
+    if not prints_url:
+        return _normal_paper_eur_price(card_data)
+
+    cheapest_value: Optional[Decimal] = None
+    cheapest_text: Optional[str] = None
+    next_url = prints_url
+
+    try:
+        while next_url:
+            time.sleep(0.1)  # Respect Scryfall's request guidance.
+            response = requests.get(next_url, **_get_request_kwargs())
+            response.raise_for_status()
+            page = response.json()
+
+            for printing in page.get("data", []):
+                price_text = _normal_paper_eur_price(printing)
+                if price_text is None:
+                    continue
+
+                try:
+                    price_value = Decimal(price_text)
+                except (InvalidOperation, ValueError, TypeError):
+                    continue
+
+                if cheapest_value is None or price_value < cheapest_value:
+                    cheapest_value = price_value
+                    cheapest_text = price_text
+
+            next_url = page.get("next_page") if page.get("has_more") else None
+    except (requests.exceptions.RequestException, ValueError, TypeError) as err:
+        # Card lookup itself succeeded.  Do not discard the whole card just
+        # because the secondary print-history request failed; fall back to the
+        # resolved printing's regular EUR price instead.
+        print(f"Could not check all printings for '{card_data.get('name', 'Unknown')}': {err}")
+        return _normal_paper_eur_price(card_data)
+
+    return cheapest_text
+
+
 def fetch_card_data(card_name: str) -> Optional[Dict]:
     """
-    Fetches card data from the Scryfall API for a given card name.
+    Fetch card data from Scryfall and attach the cheapest regular paper EUR
+    price across all printings of that card.
     """
     time.sleep(0.1)  # Rate limit
 
@@ -69,12 +149,15 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
         response = requests.get(
             url,
             params=params,
-            headers=SCRYFALL_HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            verify=SSL_CERT_FILE,
+            **_get_request_kwargs(),
         )
         response.raise_for_status()
-        return response.json()
+        card_data = response.json()
+
+        # Store the computed value on the same object that gets cached.  A
+        # value of None is intentional and means no eligible EUR price exists.
+        card_data[CHEAPEST_EUR_PRICE_KEY] = _fetch_cheapest_normal_paper_eur(card_data)
+        return card_data
 
     except requests.exceptions.HTTPError as err:
         if err.response is not None and err.response.status_code == 404:
@@ -153,6 +236,7 @@ def fetch_bulk_data_url() -> Optional[str]:
     except (ValueError, TypeError) as err:
         print(f"Invalid bulk data metadata response: {err}")
         return None
+
 
 def download_bulk_json(
     download_url: str,

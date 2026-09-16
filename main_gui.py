@@ -11,6 +11,19 @@ from models import Card
 from parser import parse_decklist
 
 
+MAX_PROGRESS_UPDATES = 200
+TABLE_INSERT_BATCH_SIZE = 500
+TREE_PREVIEW_LIMIT = 180
+
+
+def _should_report_progress(current: int, total: int) -> bool:
+    """Limit worker progress chatter while still keeping the UI informative."""
+    if total <= 0 or current <= 1 or current >= total:
+        return True
+    step = max(1, (total + MAX_PROGRESS_UPDATES - 1) // MAX_PROGRESS_UPDATES)
+    return current % step == 0
+
+
 def _attach_available_meld_results(deck, db: CardDatabase, progress_queue: queue.Queue):
     """
     Attach a meld result only when every required meld component is in the deck.
@@ -78,14 +91,17 @@ def build_detailed_deck(decklist_text: str, progress_queue: queue.Queue, db: Car
         total_cards = len(card_queries)
 
         for i, query in enumerate(card_queries):
+            current = i + 1
             input_name = query['name']
             input_key = input_name.casefold()
 
             if input_key in processed_card_names:
-                progress_queue.put(('progress', i + 1, total_cards, f"Skipping {input_name} (already handled)"))
+                if _should_report_progress(current, total_cards):
+                    progress_queue.put(('progress', current, total_cards, f"Skipping {input_name} (already handled)"))
                 continue
 
-            progress_queue.put(('progress', i + 1, total_cards, f"Processing: {input_name}"))
+            if _should_report_progress(current, total_cards):
+                progress_queue.put(('progress', current, total_cards, f"Processing: {input_name}"))
 
             # 1. Try local DB.
             scryfall_json = db.get_card(input_name)
@@ -164,16 +180,17 @@ class MtgDeckFormatterApp:
         self.show_rarity_var = tk.BooleanVar(value=True)
 
         self.comm_queue = queue.Queue()
+        self.worker_thread = None
         self.current_deck = []
+        self.table_rows = []
+        self._table_render_generation = 0
         self.create_widgets()
 
     def create_widgets(self):
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TableHeader.TLabel", font=("TkDefaultFont", 10, "bold"), padding=(6, 5), relief="solid", borderwidth=1)
-        style.configure("TableCell.TLabel", padding=(6, 5), relief="solid", borderwidth=1)
-        style.configure("TableCard.TLabel", font=("TkDefaultFont", 10, "bold"), padding=(6, 5), relief="solid", borderwidth=1)
-        style.configure("TableMeld.TLabel", font=("TkDefaultFont", 10, "italic"), padding=(6, 5), relief="solid", borderwidth=1)
+        style.configure("Deck.Treeview", rowheight=26)
+        style.configure("Deck.Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
 
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -232,35 +249,105 @@ class MtgDeckFormatterApp:
 
         output_frame = ttk.LabelFrame(main_frame, text="Deck Table", padding="10")
         output_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        output_frame.rowconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=4)
+        output_frame.rowconfigure(2, weight=1)
         output_frame.columnconfigure(0, weight=1)
 
-        self.output_canvas = tk.Canvas(output_frame, highlightthickness=0)
-        self.output_canvas.grid(row=0, column=0, sticky="nsew")
+        tree_frame = ttk.Frame(output_frame)
+        tree_frame.grid(row=0, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
 
-        y_scroll = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.output_canvas.yview)
+        self.output_tree = ttk.Treeview(
+            tree_frame,
+            show="headings",
+            style="Deck.Treeview",
+            selectmode="browse",
+        )
+        self.output_tree.grid(row=0, column=0, sticky="nsew")
+        self.output_tree.bind("<<TreeviewSelect>>", self._on_table_selection)
+
+        y_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.output_tree.yview)
         y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll = ttk.Scrollbar(output_frame, orient=tk.HORIZONTAL, command=self.output_canvas.xview)
+        x_scroll = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.output_tree.xview)
         x_scroll.grid(row=1, column=0, sticky="ew")
+        self.output_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
-        self.output_canvas.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        # A Treeview uses one widget for the entire table rather than one widget
+        # per cell. This avoids huge X11 widget/pixmap allocations on Linux.
+        self.output_tree.tag_configure("meld_result", font=("TkDefaultFont", 10, "italic"))
 
-        self.table_frame = ttk.Frame(self.output_canvas)
-        self.table_window = self.output_canvas.create_window((0, 0), window=self.table_frame, anchor="nw")
-        self.table_frame.bind("<Configure>", self._update_table_scroll_region)
+        ttk.Label(output_frame, text="Selected Card Details", font=("TkDefaultFont", 10, "bold")).grid(
+            row=1, column=0, sticky="w", pady=(8, 3)
+        )
+        self.detail_text = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, height=7, state=tk.DISABLED)
+        self.detail_text.grid(row=2, column=0, sticky="nsew")
 
-        self._show_empty_table_message()
+        self._configure_tree_columns()
+        self._set_detail_text("Process a decklist to display the table here.")
 
-    def _update_table_scroll_region(self, _event=None):
-        self.output_canvas.configure(scrollregion=self.output_canvas.bbox("all"))
+    def _clear_comm_queue(self):
+        while True:
+            try:
+                self.comm_queue.get_nowait()
+            except queue.Empty:
+                break
 
-    def _show_empty_table_message(self):
-        ttk.Label(
-            self.table_frame,
-            text="Process a decklist to display the table here.",
-            padding=12,
-        ).grid(row=0, column=0, sticky="w")
-        self._update_table_scroll_region()
+    def _configure_tree_columns(self):
+        columns = get_table_columns(
+            show_price=self.show_price_var.get(),
+            show_rarity=self.show_rarity_var.get(),
+        )
+        column_keys = [key for key, _heading, _width in columns]
+        self.output_tree.configure(columns=column_keys)
+
+        for key, heading, width in columns:
+            self.output_tree.heading(key, text=heading)
+            anchor = tk.CENTER if key in {"quantity", "price"} else tk.W
+            self.output_tree.column(
+                key,
+                width=width,
+                minwidth=max(45, min(width, 100)),
+                anchor=anchor,
+                stretch=False,
+            )
+
+        return columns
+
+    @staticmethod
+    def _tree_cell_text(value):
+        text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = " | ".join(part.strip() for part in text.split("\n") if part.strip())
+        if len(text) > TREE_PREVIEW_LIMIT:
+            return text[:TREE_PREVIEW_LIMIT - 1].rstrip() + "&"
+        return text
+
+    def _set_detail_text(self, text):
+        self.detail_text.config(state=tk.NORMAL)
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert("1.0", text)
+        self.detail_text.config(state=tk.DISABLED)
+
+    def _on_table_selection(self, _event=None):
+        selection = self.output_tree.selection()
+        if not selection:
+            return
+
+        item_id = selection[0]
+        try:
+            row_index = int(item_id.rsplit("-", 1)[1])
+            row = self.table_rows[row_index]
+        except (ValueError, IndexError):
+            return
+
+        details = []
+        for key, heading, _width in get_table_columns(show_price=True, show_rarity=True):
+            value = row.get(key, "")
+            if value in (None, ""):
+                value = ""
+            details.append(f"{heading}: {value}")
+
+        self._set_detail_text("\n\n".join(details))
 
     def start_processing_thread(self):
         decklist = self.input_text.get("1.0", tk.END)
@@ -268,6 +355,7 @@ class MtgDeckFormatterApp:
             messagebox.showwarning("Input Required", "Please paste a decklist before processing.")
             return
 
+        self._clear_comm_queue()
         self.process_button.config(state=tk.DISABLED)
         self.db_button.config(state=tk.DISABLED)
         self.clear_fields(output_only=True)
@@ -279,7 +367,7 @@ class MtgDeckFormatterApp:
             daemon=True,
         )
         self.worker_thread.start()
-        self.root.after(100, self.check_queue)
+        self.root.after(25, self.check_queue)
 
     def start_db_update_thread(self):
         confirm = messagebox.askyesno(
@@ -289,6 +377,7 @@ class MtgDeckFormatterApp:
         if not confirm:
             return
 
+        self._clear_comm_queue()
         self.db_button.config(state=tk.DISABLED)
         self.process_button.config(state=tk.DISABLED)
         self.progress_bar['value'] = 0
@@ -299,51 +388,66 @@ class MtgDeckFormatterApp:
             daemon=True,
         )
         self.worker_thread.start()
-        self.root.after(100, self.check_queue)
+        self.root.after(25, self.check_queue)
+
+    def _display_transient_message(self, message):
+        msg_type = message[0]
+
+        if msg_type == 'progress':
+            current, total, name = message[1], message[2], message[3]
+            self.progress_bar['value'] = (current / total) * 100 if total else 0
+            self.status_label.config(text=f"Processing ({current}/{total}): {name}")
+        elif msg_type == 'status':
+            self.status_label.config(text=message[1])
+        elif msg_type == 'dl_progress':
+            self.status_label.config(text=f"Downloading... {message[1]}%")
+            self.progress_bar['value'] = message[1]
+        elif msg_type == 'db_progress':
+            self.status_label.config(text=f"Importing... {message[1]}%")
+            self.progress_bar['value'] = message[1]
+
+    def _handle_terminal_message(self, message):
+        msg_type = message[0]
+
+        if msg_type == 'done':
+            self.current_deck = message[1]
+            self.table_rows = build_table_rows(self.current_deck)
+            self.reset_ui_state()
+            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
+            self.refresh_output_table()
+        elif msg_type == 'done_db':
+            self.reset_ui_state()
+            self.status_label.config(text=message[1])
+            messagebox.showinfo("Success", message[1])
+        elif msg_type == 'error':
+            self.reset_ui_state()
+            self.status_label.config(text="Error occurred.")
+            messagebox.showerror("Error", message[1])
 
     def check_queue(self):
-        try:
-            message = self.comm_queue.get(block=False)
-            msg_type = message[0]
+        """Drain pending worker messages and coalesce stale progress updates."""
+        latest_transient = None
+        terminal_message = None
 
-            if msg_type == 'progress':
-                current, total, name = message[1], message[2], message[3]
-                self.progress_bar['value'] = (current / total) * 100 if total else 0
-                self.status_label.config(text=f"Processing ({current}/{total}): {name}")
-                self.root.after(100, self.check_queue)
+        while True:
+            try:
+                message = self.comm_queue.get_nowait()
+            except queue.Empty:
+                break
 
-            elif msg_type == 'done':
-                self.current_deck = message[1]
-                self.reset_ui_state()
-                self.status_label.config(text=f"Processing complete — {len(self.current_deck)} unique cards.")
-                self.refresh_output_table()
+            if message[0] in {'done', 'done_db', 'error'}:
+                terminal_message = message
+            else:
+                latest_transient = message
 
-            elif msg_type == 'status':
-                self.status_label.config(text=message[1])
-                self.root.after(100, self.check_queue)
+        if terminal_message is not None:
+            self._handle_terminal_message(terminal_message)
+        elif latest_transient is not None:
+            self._display_transient_message(latest_transient)
 
-            elif msg_type == 'dl_progress':
-                self.status_label.config(text=f"Downloading... {message[1]}%")
-                self.progress_bar['value'] = message[1]
-                self.root.after(100, self.check_queue)
-
-            elif msg_type == 'db_progress':
-                self.status_label.config(text=f"Importing... {message[1]}%")
-                self.progress_bar['value'] = message[1]
-                self.root.after(100, self.check_queue)
-
-            elif msg_type == 'done_db':
-                self.reset_ui_state()
-                self.status_label.config(text=message[1])
-                messagebox.showinfo("Success", message[1])
-
-            elif msg_type == 'error':
-                self.reset_ui_state()
-                self.status_label.config(text="Error occurred.")
-                messagebox.showerror("Error", message[1])
-
-        except queue.Empty:
-            self.root.after(100, self.check_queue)
+        worker_running = self.worker_thread is not None and self.worker_thread.is_alive()
+        if worker_running or not self.comm_queue.empty():
+            self.root.after(25, self.check_queue)
 
     def reset_ui_state(self):
         self.process_button.config(state=tk.NORMAL)
@@ -351,65 +455,53 @@ class MtgDeckFormatterApp:
         self.progress_bar['value'] = 100
 
     def refresh_output_table(self):
-        if not hasattr(self, "table_frame"):
+        if not hasattr(self, "output_tree"):
             return
 
-        for child in self.table_frame.winfo_children():
-            child.destroy()
+        self._table_render_generation += 1
+        generation = self._table_render_generation
 
-        if not self.current_deck:
-            self._show_empty_table_message()
-            return
+        existing = self.output_tree.get_children()
+        if existing:
+            self.output_tree.delete(*existing)
 
-        columns = get_table_columns(
-            show_price=self.show_price_var.get(),
-            show_rarity=self.show_rarity_var.get(),
+        columns = self._configure_tree_columns()
+        self._set_detail_text(
+            "Select a row to see the complete card data."
+            if self.table_rows
+            else "Process a decklist to display the table here."
         )
-        rows = build_table_rows(self.current_deck)
 
-        # Clear min-widths left behind when optional columns are hidden.
-        for col_index in range(len(get_table_columns(show_price=True, show_rarity=True))):
-            self.table_frame.grid_columnconfigure(col_index, minsize=0, weight=0)
+        if not self.table_rows:
+            return
 
-        for col_index, (key, heading, width) in enumerate(columns):
-            self.table_frame.grid_columnconfigure(col_index, minsize=width, weight=0)
-            header = ttk.Label(
-                self.table_frame,
-                text=heading,
-                style="TableHeader.TLabel",
-                anchor=tk.CENTER,
-                justify=tk.CENTER,
+        self.output_tree.xview_moveto(0)
+        self.output_tree.yview_moveto(0)
+        self._insert_table_rows(generation, columns, 0)
+
+    def _insert_table_rows(self, generation, columns, start_index):
+        """Insert Treeview rows in batches so large decks keep the UI responsive."""
+        if generation != self._table_render_generation:
+            return
+
+        end_index = min(start_index + TABLE_INSERT_BATCH_SIZE, len(self.table_rows))
+        for row_index in range(start_index, end_index):
+            row = self.table_rows[row_index]
+            values = [self._tree_cell_text(row.get(key, "")) for key, _heading, _width in columns]
+            tags = ("meld_result",) if row.get("_row_kind") == "meld_result" else ()
+            self.output_tree.insert(
+                "",
+                tk.END,
+                iid=f"row-{row_index}",
+                values=values,
+                tags=tags,
             )
-            header.grid(row=0, column=col_index, sticky="nsew")
 
-        for row_index, row in enumerate(rows, start=1):
-            is_meld_result = row.get("_row_kind") == "meld_result"
-
-            for col_index, (key, _heading, width) in enumerate(columns):
-                if is_meld_result:
-                    cell_style = "TableMeld.TLabel"
-                elif key == "card":
-                    cell_style = "TableCard.TLabel"
-                else:
-                    cell_style = "TableCell.TLabel"
-
-                anchor = tk.CENTER if key == "quantity" else tk.NW
-                justify = tk.CENTER if key == "quantity" else tk.LEFT
-
-                cell = ttk.Label(
-                    self.table_frame,
-                    text=row.get(key, ""),
-                    style=cell_style,
-                    anchor=anchor,
-                    justify=justify,
-                    wraplength=max(40, width - 12),
-                )
-                cell.grid(row=row_index, column=col_index, sticky="nsew")
-
-        self.output_canvas.xview_moveto(0)
-        self.output_canvas.yview_moveto(0)
-        self.root.update_idletasks()
-        self._update_table_scroll_region()
+        if end_index < len(self.table_rows):
+            self.status_label.config(text=f"Rendering table... {end_index}/{len(self.table_rows)} rows")
+            self.root.after_idle(self._insert_table_rows, generation, columns, end_index)
+        else:
+            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
 
     def copy_to_clipboard(self):
         if not self.current_deck:
@@ -432,7 +524,8 @@ class MtgDeckFormatterApp:
             self.input_text.delete("1.0", tk.END)
 
         self.current_deck = []
-        if hasattr(self, "table_frame"):
+        self.table_rows = []
+        if hasattr(self, "output_tree"):
             self.refresh_output_table()
 
         self.progress_bar['value'] = 0
@@ -449,3 +542,4 @@ if __name__ == "__main__":
     app = MtgDeckFormatterApp(app_root)
     app_root.protocol("WM_DELETE_WINDOW", app.on_close)
     app_root.mainloop()
+ 

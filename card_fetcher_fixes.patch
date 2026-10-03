@@ -1,0 +1,763 @@
+From 5445cca5f04c038435ef3d3e18790c82630eed65 Mon Sep 17 00:00:00 2001
+From: Claude <claude@example.com>
+Date: Sat, 3 Oct 2026 13:55:14 +0000
+Subject: [PATCH] Report skipped cards, robust decklist parsing, merge
+ duplicates, EUR naming, face-name DB aliases
+
+---
+ .gitignore       |  13 +++++
+ README.md        |   6 +-
+ api_client.py    |  39 +++++++++----
+ database.py      |  49 +++++++++++++++-
+ formatter.py     |  10 ++--
+ main.py          |  28 +++++++---
+ main_gui.py      | 130 ++++++++++++++++++++++++++++++++++---------
+ models.py        |   6 +-
+ parser.py        | 142 ++++++++++++++++++++++++++++++++++++-----------
+ requirements.txt |   3 +-
+ 10 files changed, 339 insertions(+), 87 deletions(-)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..e842881
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,13 @@
++# Python
++__pycache__/
++*.py[cod]
++venv/
++.venv/
++
++# PyInstaller output
++build/
++dist/
++
++# IDE
++.idea/
++.vscode/
+diff --git a/README.md b/README.md
+index f853c8e..a3d5e14 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,9 @@ A simple yet powerful desktop application for Windows, Mac, and Linux that takes
+ 
+ ## Features
+ 
+--   **Flexible Parsing**: Accepts various decklist formats (e.g., `1x Sol Ring`, `Sol Ring`, `4 Counterspell (SET) 123`).
++-   **Flexible Parsing**: Accepts various decklist formats (e.g., `1x Sol Ring`, `Sol Ring`, `1 High Tide (FEM) 18b`, `1 Loki, God of Mischief (PMEI) 2026-14 *F*`) and exports from MTG Arena, Moxfield, Archidekt and MTGO. Duplicate entries are merged.
++-   **Skipped Card Report**: Any line that couldn't be read or found on Scryfall is listed in a dialog after processing, together with the reason.
++-   **Euro Pricing**: Shows the cheapest regular (nonfoil) paper EUR price across all printings.
+ -   **Detailed Card Information**: Fetches and displays mana cost, colors, card type, full oracle text, and P/T for creatures.
+ -   **Responsive GUI**: The app remains fully responsive while fetching card data in the background, with a progress bar to show its status.
+ -   **Simple Interface**: A clean and intuitive UI built with Python's native Tkinter library.
+@@ -20,7 +22,7 @@ To run this application, you will need Python 3 installed on your system.
+ 1.  **Clone the repository:**
+     ```bash
+     git clone https://github.com/Moe98DE/Card_Fetcher.git
+-    cd mtg-deck-formatter
++    cd Card_Fetcher
+     ```
+ 
+ 2.  **Create a virtual environment (recommended):**
+diff --git a/api_client.py b/api_client.py
+index 74e906c..cdacf4c 100644
+--- a/api_client.py
++++ b/api_client.py
+@@ -3,7 +3,7 @@ import json
+ import os
+ import time
+ from decimal import Decimal, InvalidOperation
+-from typing import Dict, Optional, List
++from typing import Dict, List, Optional, Tuple
+ import gzip
+ import tempfile
+ 
+@@ -135,10 +135,13 @@ def _fetch_cheapest_normal_paper_eur(card_data: Dict) -> Optional[str]:
+     return cheapest_text
+ 
+ 
+-def fetch_card_data(card_name: str) -> Optional[Dict]:
++def lookup_card(card_name: str) -> Tuple[Optional[Dict], Optional[str]]:
+     """
+     Fetch card data from Scryfall and attach the cheapest regular paper EUR
+     price across all printings of that card.
++
++    Returns (card_data, None) on success, or (None, reason) where reason is a
++    short human-readable explanation suitable for showing to the user.
+     """
+     time.sleep(0.1)  # Rate limit
+ 
+@@ -157,27 +160,43 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
+         # Store the computed value on the same object that gets cached.  A
+         # value of None is intentional and means no eligible EUR price exists.
+         card_data[CHEAPEST_EUR_PRICE_KEY] = _fetch_cheapest_normal_paper_eur(card_data)
+-        return card_data
++        return card_data, None
+ 
+     except requests.exceptions.HTTPError as err:
+-        if err.response is not None and err.response.status_code == 404:
++        status = err.response.status_code if err.response is not None else None
++        details = None
++        if err.response is not None:
++            try:
++                details = err.response.json().get("details")
++            except ValueError:
++                details = None
++
++        if status == 404:
+             print(f"Error: Card '{card_name}' not found.")
+-        else:
+-            print(f"HTTP Error fetching '{card_name}': {err}")
+-        return None
++            # Scryfall explains e.g. "Too many cards match ambiguous name".
++            return None, details or "Card not found on Scryfall"
++
++        print(f"HTTP Error fetching '{card_name}': {err}")
++        return None, f"Scryfall returned HTTP {status}" + (f": {details}" if details else "")
+ 
+     except requests.exceptions.SSLError as err:
+         print(f"SSL Error fetching '{card_name}'.")
+         _print_ssl_help(err)
+-        return None
++        return None, "SSL certificate error (see console output)"
+ 
+     except requests.exceptions.RequestException as err:
+         print(f"Request Error fetching '{card_name}': {err}")
+-        return None
++        return None, "Network error while contacting Scryfall"
+ 
+     except Exception as err:
+         print(f"Unexpected error fetching '{card_name}': {err}")
+-        return None
++        return None, f"Unexpected error: {err}"
++
++
++def fetch_card_data(card_name: str) -> Optional[Dict]:
++    """Backwards-compatible wrapper returning only the card data (or None)."""
++    card_data, _reason = lookup_card(card_name)
++    return card_data
+ 
+ 
+ def fetch_bulk_data_url() -> Optional[str]:
+diff --git a/database.py b/database.py
+index c6f1973..e92fadb 100644
+--- a/database.py
++++ b/database.py
+@@ -82,16 +82,49 @@ class CardDatabase:
+                 data TEXT
+             )
+         ''')
++        # Maps individual face names ("delver of secrets") to the full card
++        # name used as the primary key ("delver of secrets // insectile aberration").
++        cursor.execute('''
++            CREATE TABLE IF NOT EXISTS aliases (
++                alias TEXT PRIMARY KEY,
++                name_normalized TEXT NOT NULL
++            )
++        ''')
+         self.conn.commit()
+ 
++    @staticmethod
++    def _normalize(name: str) -> str:
++        return name.lower().strip()
++
++    @classmethod
++    def _face_aliases(cls, card_data: dict):
++        """Face names of a multi-part card that differ from its full name."""
++        full_key = cls._normalize(card_data.get('name', ''))
++        aliases = set()
++        for face in card_data.get('card_faces') or []:
++            face_name = face.get('name')
++            if face_name:
++                alias = cls._normalize(face_name)
++                if alias and alias != full_key:
++                    aliases.add(alias)
++        return aliases
++
+     def get_card(self, card_name: str):
+         """Returns the Dict (JSON) of the card if found, else None."""
+         cursor = self.conn.cursor()
+-        # Simple normalization: lowercase and stripped
+-        key = card_name.lower().strip()
++        key = self._normalize(card_name)
+         cursor.execute("SELECT data FROM cards WHERE name_normalized = ?", (key,))
+         row = cursor.fetchone()
+ 
++        if not row:
++            # Fall back to a face name of a double-faced / adventure / split card.
++            cursor.execute(
++                "SELECT c.data FROM aliases a JOIN cards c ON c.name_normalized = a.name_normalized "
++                "WHERE a.alias = ?",
++                (key,),
++            )
++            row = cursor.fetchone()
++
+         if row:
+             card_data = json.loads(row[0])
+ 
+@@ -109,7 +142,7 @@ class CardDatabase:
+         if not card_data or 'name' not in card_data:
+             return
+ 
+-        key = card_data['name'].lower().strip()
++        key = self._normalize(card_data['name'])
+         json_str = json.dumps(card_data)
+ 
+         cursor = self.conn.cursor()
+@@ -117,6 +150,11 @@ class CardDatabase:
+             INSERT OR REPLACE INTO cards (name_normalized, data)
+             VALUES (?, ?)
+         ''', (key, json_str))
++        for alias in self._face_aliases(card_data):
++            cursor.execute(
++                "INSERT OR REPLACE INTO aliases (alias, name_normalized) VALUES (?, ?)",
++                (alias, key),
++            )
+         self.conn.commit()
+ 
+     def bulk_import(self, cards_list, progress_callback=None):
+@@ -167,6 +205,11 @@ class CardDatabase:
+                     "INSERT OR REPLACE INTO cards (name_normalized, data) VALUES (?, ?)",
+                     (key, json_str)
+                 )
++                for alias in self._face_aliases(card):
++                    cursor.execute(
++                        "INSERT OR REPLACE INTO aliases (alias, name_normalized) VALUES (?, ?)",
++                        (alias, key),
++                    )
+ 
+             if progress_callback and i % 1000 == 0:
+                 progress_callback(i, total)
+diff --git a/formatter.py b/formatter.py
+index d1d3082..5f15fe7 100644
+--- a/formatter.py
++++ b/formatter.py
+@@ -188,7 +188,7 @@ def _card_to_table_row(card: Card, quantity: str = None, row_kind: str = "card")
+         "stats": stats or "—",
+         "text": rules_text or "—",
+         "rarity": card.rarity.title() if card.rarity else "—",
+-        "price": f"€{card.price_usd}" if card.price_usd else "—",
++        "price": f"€{card.price_eur}" if card.price_eur else "—",
+         "notes": note,
+         "_row_kind": row_kind,
+     }
+@@ -378,8 +378,8 @@ def _format_card_block(card: Card, show_price: bool, show_rarity: bool) -> List[
+         summary = []
+         if show_rarity and card.rarity:
+             summary.append(card.rarity.title())
+-        if show_price and card.price_usd:
+-            summary.append(f"Price: €{card.price_usd}")
++        if show_price and card.price_eur:
++            summary.append(f"Price: €{card.price_eur}")
+ 
+         out.extend(_align_right(f"{card.quantity}x {card.name}", "   •   ".join(summary)).splitlines())
+         out.append(f"  Layout: {_layout_name(card.layout)}")
+@@ -398,8 +398,8 @@ def _format_card_block(card: Card, show_price: bool, show_rarity: bool) -> List[
+         right_side = []
+         if _should_display_colors(card):
+             right_side.append(f"Colors: {_format_colors(card.colors)}")
+-        if show_price and card.price_usd:
+-            right_side.append(f"Price: €{card.price_usd}")
++        if show_price and card.price_eur:
++            right_side.append(f"Price: €{card.price_eur}")
+ 
+         out.extend(_align_right(f"  {type_line}", "   •   ".join(right_side)).splitlines())
+ 
+diff --git a/main.py b/main.py
+index 899eff7..1d9330c 100644
+--- a/main.py
++++ b/main.py
+@@ -1,12 +1,14 @@
+ # main.py
+-from parser import parse_decklist
+-from api_client import fetch_card_data
++from parser import parse_decklist_detailed
++from api_client import lookup_card
+ from models import Card
+ from formatter import format_deck_as_text
+ 
+ # Example decklist with various formats
+ SAMPLE_DECKLIST = """
+ 1x Sol Ring (EOE) 245
++1 High Tide (FEM) 18b
++1 Loki, God of Mischief (PMEI) 2026-14 *F*
+ 3x Command Tower (TDC) 203
+ Lightning Bolt
+ 6 Mountain
+@@ -21,30 +23,40 @@ def process_decklist(decklist_text: str):
+     Parses a decklist, fetches data for each card, and prints the formatted result.
+     """
+     print("Parsing decklist...")
+-    card_queries = parse_decklist(decklist_text)
+-    
++    parsed = parse_decklist_detailed(decklist_text)
++    card_queries = parsed.cards
++    skipped = list(parsed.skipped)
++
+     if not card_queries:
+         print("Decklist is empty or could not be parsed.")
+         return
+ 
+     print(f"Found {len(card_queries)} unique cards. Fetching data from Scryfall...")
+-    
++
+     detailed_deck = []
+     for query in card_queries:
+         card_name = query['name']
+         quantity = query['quantity']
+-        
++
+         print(f"  Fetching: {card_name}")
+-        scryfall_json = fetch_card_data(card_name)
+-        
++        scryfall_json, reason = lookup_card(card_name)
++
+         if scryfall_json:
+             card_object = Card.from_scryfall_json(scryfall_json, quantity)
+             detailed_deck.append(card_object)
++        else:
++            for line in query['lines']:
++                skipped.append({'line': line, 'reason': reason or "Card not found"})
+ 
+     print("\n--- Detailed Decklist ---\n")
+     formatted_output = format_deck_as_text(detailed_deck)
+     print(formatted_output)
+ 
++    if skipped:
++        print(f"\n--- Skipped {len(skipped)} line(s) ---")
++        for entry in skipped:
++            print(f"  {entry['line']}  —  {entry['reason']}")
++
+ 
+ if __name__ == "__main__":
+     # You can replace SAMPLE_DECKLIST with input() to make it interactive
+diff --git a/main_gui.py b/main_gui.py
+index bf1ac69..956354d 100644
+--- a/main_gui.py
++++ b/main_gui.py
+@@ -4,11 +4,11 @@ import threading
+ import tkinter as tk
+ from tkinter import messagebox, scrolledtext, ttk
+ 
+-from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data
++from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data, lookup_card
+ from database import CardDatabase
+ from formatter import build_table_rows, format_deck_as_markdown, get_table_columns
+ from models import Card
+-from parser import parse_decklist
++from parser import parse_decklist_detailed
+ 
+ 
+ MAX_PROGRESS_UPDATES = 200
+@@ -80,54 +80,68 @@ def _attach_available_meld_results(deck, db: CardDatabase, progress_queue: queue
+ 
+ 
+ def build_detailed_deck(decklist_text: str, progress_queue: queue.Queue, db: CardDatabase):
++    """
++    Worker: parse the decklist, resolve each card, and report the result.
++
++    Sends ('done', deck, skipped) on success, where skipped is a list of
++    {'line': ..., 'reason': ...} dicts for every line that did not make it
++    into the deck. Sends ('error', message, skipped) if nothing could be used.
++    """
+     try:
+-        card_queries = parse_decklist(decklist_text)
++        parsed = parse_decklist_detailed(decklist_text)
++        skipped = list(parsed.skipped)
++        card_queries = parsed.cards
++
+         if not card_queries:
+-            progress_queue.put(('error', "Decklist is empty or could not be parsed."))
++            progress_queue.put(('error', "Decklist is empty or could not be parsed.", skipped))
+             return
+ 
+-        detailed_deck = []
+-        processed_card_names = set()
++        # Keyed by the resolved Scryfall name so that e.g. "Delver of Secrets"
++        # and "Delver of Secrets // Insectile Aberration" become one entry.
++        cards_by_name = {}
+         total_cards = len(card_queries)
+ 
+         for i, query in enumerate(card_queries):
+             current = i + 1
+             input_name = query['name']
+-            input_key = input_name.casefold()
+-
+-            if input_key in processed_card_names:
+-                if _should_report_progress(current, total_cards):
+-                    progress_queue.put(('progress', current, total_cards, f"Skipping {input_name} (already handled)"))
+-                continue
+ 
+             if _should_report_progress(current, total_cards):
+                 progress_queue.put(('progress', current, total_cards, f"Processing: {input_name}"))
+ 
+             # 1. Try local DB.
+             scryfall_json = db.get_card(input_name)
++            reason = None
+ 
+             # 2. Fall back to Scryfall and cache successful results.
+             if not scryfall_json:
+-                scryfall_json = fetch_card_data(input_name)
++                scryfall_json, reason = lookup_card(input_name)
+                 if scryfall_json:
+                     db.save_card(scryfall_json)
+ 
+-            if scryfall_json:
+-                card_object = Card.from_scryfall_json(scryfall_json, query['quantity'])
+-                detailed_deck.append(card_object)
+-                processed_card_names.add(input_key)
+-                processed_card_names.add(card_object.name.casefold())
++            if not scryfall_json:
++                for line in query.get('lines') or [input_name]:
++                    skipped.append({'line': line, 'reason': reason or "Card not found"})
++                continue
++
++            resolved_key = scryfall_json.get('name', input_name).casefold()
++            existing = cards_by_name.get(resolved_key)
++            if existing:
++                existing.quantity += query['quantity']
++            else:
++                cards_by_name[resolved_key] = Card.from_scryfall_json(scryfall_json, query['quantity'])
++
++        detailed_deck = list(cards_by_name.values())
+ 
+         if not detailed_deck:
+-            progress_queue.put(('error', "No cards were found. Check the card names."))
++            progress_queue.put(('error', "No cards were found. Check the card names.", skipped))
+             return
+ 
+         # Meld results are resolved only after the whole deck is known.
+         _attach_available_meld_results(detailed_deck, db, progress_queue)
+-        progress_queue.put(('done', detailed_deck))
++        progress_queue.put(('done', detailed_deck, skipped))
+ 
+     except Exception as exc:
+-        progress_queue.put(('error', f"Could not process the decklist:\n{exc}"))
++        progress_queue.put(('error', f"Could not process the decklist:\n{exc}", []))
+ 
+ 
+ def update_database_logic(progress_queue: queue.Queue, db: CardDatabase):
+@@ -182,6 +196,7 @@ class MtgDeckFormatterApp:
+         self.comm_queue = queue.Queue()
+         self.worker_thread = None
+         self.current_deck = []
++        self.skipped_cards = []
+         self.table_rows = []
+         self._table_render_generation = 0
+         self.create_widgets()
+@@ -319,7 +334,7 @@ class MtgDeckFormatterApp:
+         text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+         text = " | ".join(part.strip() for part in text.split("\n") if part.strip())
+         if len(text) > TREE_PREVIEW_LIMIT:
+-            return text[:TREE_PREVIEW_LIMIT - 1].rstrip() + "&"
++            return text[:TREE_PREVIEW_LIMIT - 1].rstrip() + "…"
+         return text
+ 
+     def _set_detail_text(self, text):
+@@ -344,7 +359,7 @@ class MtgDeckFormatterApp:
+         for key, heading, _width in get_table_columns(show_price=True, show_rarity=True):
+             value = row.get(key, "")
+             if value in (None, ""):
+-                value = ""
++                value = "—"
+             details.append(f"{heading}: {value}")
+ 
+         self._set_detail_text("\n\n".join(details))
+@@ -411,10 +426,12 @@ class MtgDeckFormatterApp:
+ 
+         if msg_type == 'done':
+             self.current_deck = message[1]
++            self.skipped_cards = message[2] if len(message) > 2 else []
+             self.table_rows = build_table_rows(self.current_deck)
+             self.reset_ui_state()
+-            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
+             self.refresh_output_table()
++            if self.skipped_cards:
++                self.show_skipped_dialog(self.skipped_cards)
+         elif msg_type == 'done_db':
+             self.reset_ui_state()
+             self.status_label.config(text=message[1])
+@@ -423,6 +440,68 @@ class MtgDeckFormatterApp:
+             self.reset_ui_state()
+             self.status_label.config(text="Error occurred.")
+             messagebox.showerror("Error", message[1])
++            skipped = message[2] if len(message) > 2 else []
++            if skipped:
++                self.skipped_cards = skipped
++                self.show_skipped_dialog(skipped)
++
++    def _completion_status_text(self):
++        text = f"Processing complete — {len(self.current_deck)} unique cards."
++        if self.skipped_cards:
++            count = len(self.skipped_cards)
++            text += f" {count} line{'s' if count != 1 else ''} skipped."
++        return text
++
++    def show_skipped_dialog(self, skipped):
++        """Show every skipped decklist line with the reason it was skipped."""
++        dialog = tk.Toplevel(self.root)
++        count = len(skipped)
++        dialog.title(f"{count} card{'s' if count != 1 else ''} skipped")
++        dialog.transient(self.root)
++        dialog.geometry("640x360")
++        dialog.minsize(420, 220)
++
++        frame = ttk.Frame(dialog, padding=10)
++        frame.pack(fill=tk.BOTH, expand=True)
++
++        ttk.Label(
++            frame,
++            text=f"These {count} line{'s were' if count != 1 else ' was'} not added to the deck:",
++            font=("TkDefaultFont", 10, "bold"),
++        ).pack(anchor="w", pady=(0, 6))
++
++        report = "\n".join(f"{entry['line']}  —  {entry['reason']}" for entry in skipped)
++
++        text_box = scrolledtext.ScrolledText(frame, wrap=tk.WORD, height=10)
++        text_box.insert("1.0", report)
++        text_box.config(state=tk.DISABLED)
++        text_box.pack(fill=tk.BOTH, expand=True)
++
++        button_row = ttk.Frame(frame)
++        button_row.pack(fill=tk.X, pady=(8, 0))
++
++        copy_lines = "\n".join(entry['line'] for entry in skipped)
++
++        def copy_skipped():
++            self.root.clipboard_clear()
++            self.root.clipboard_append(copy_lines)
++            copy_btn.config(text="Copied!")
++            dialog.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.config(text="Copy Skipped Lines"))
++
++        copy_btn = ttk.Button(button_row, text="Copy Skipped Lines", command=copy_skipped)
++        copy_btn.pack(side=tk.LEFT)
++        close_btn = ttk.Button(button_row, text="Close", command=dialog.destroy)
++        close_btn.pack(side=tk.RIGHT)
++
++        dialog.bind("<Escape>", lambda _e: dialog.destroy())
++        close_btn.focus_set()
++
++        # Center over the main window.
++        dialog.update_idletasks()
++        width, height = 640, 360
++        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
++        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 3
++        dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+ 
+     def check_queue(self):
+         """Drain pending worker messages and coalesce stale progress updates."""
+@@ -501,7 +580,7 @@ class MtgDeckFormatterApp:
+             self.status_label.config(text=f"Rendering table... {end_index}/{len(self.table_rows)} rows")
+             self.root.after_idle(self._insert_table_rows, generation, columns, end_index)
+         else:
+-            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
++            self.status_label.config(text=self._completion_status_text())
+ 
+     def copy_to_clipboard(self):
+         if not self.current_deck:
+@@ -524,6 +603,7 @@ class MtgDeckFormatterApp:
+             self.input_text.delete("1.0", tk.END)
+ 
+         self.current_deck = []
++        self.skipped_cards = []
+         self.table_rows = []
+         if hasattr(self, "output_tree"):
+             self.refresh_output_table()
+diff --git a/models.py b/models.py
+index beb386f..e651bc1 100644
+--- a/models.py
++++ b/models.py
+@@ -26,7 +26,7 @@ class Card:
+     name: str
+     colors: List[str]
+     quantity: int
+-    price_usd: Optional[str] = None
++    price_eur: Optional[str] = None
+     rarity: Optional[str] = None
+     layout: str = "normal"
+     card_faces: List[CardFace] = field(default_factory=list)
+@@ -86,7 +86,9 @@ class Card:
+             name=scryfall_data.get('name', 'N/A'),
+             colors=scryfall_data.get('colors', []),
+             quantity=quantity,
+-            price_usd=scryfall_data.get('_cheapest_normal_paper_eur', scryfall_data.get('prices', {}).get('eur')),
++            # Cheapest regular (nonfoil) paper EUR price across all printings, falling
++            # back to this printing's EUR price for data cached without it.
++            price_eur=scryfall_data.get('_cheapest_normal_paper_eur', (scryfall_data.get('prices') or {}).get('eur')),
+             rarity=scryfall_data.get('rarity'),
+             layout=scryfall_data.get('layout', 'normal'),
+             card_faces=faces,
+diff --git a/parser.py b/parser.py
+index 6e57fb1..4a1c04c 100644
+--- a/parser.py
++++ b/parser.py
+@@ -1,43 +1,123 @@
+ # parser.py
+ import re
+-from typing import List, Dict
++from dataclasses import dataclass, field
++from typing import Dict, List
+ 
+-def parse_decklist(decklist_text: str) -> List[Dict[str, str]]:
++# "4 Sol Ring", "4x Sol Ring", "4X Sol Ring", "4 x Sol Ring"
++_QUANTITY_RE = re.compile(r"^(\d+)\s*[xX]?\s+(.*)$|^(\d+)[xX](\S.*)$")
++
++# Trailing decorations added by deck builders, stripped repeatedly from the end:
++#   *F*  *E*  *CMDR*          Moxfield foil / etched / commander markers
++#   [Ramp]  ^Have,#37d67a^     Archidekt categories and labels
++#   #tag                      tags
++#   (FEM) 18b / (PMEI) 2026-14 / (SLD) 123★ / (CMM)
++#                             set code with an optional collector number of any shape
++_TRAILING_PATTERNS = (
++    re.compile(r"\s+\*[A-Za-z]+\*$"),
++    re.compile(r"\s+\[[^\]]*\]$"),
++    re.compile(r"\s+\^[^^]*\^$"),
++    re.compile(r"\s+#\S+$"),
++    re.compile(r"(?:^|\s+)\([A-Za-z0-9]{2,6}\)(?:\s+\S+)?$"),
++)
++
++# Lines that only introduce a section of the list.
++_SECTION_HEADERS = {
++    "about", "deck", "main", "maindeck", "main deck", "mainboard",
++    "sideboard", "side", "commander", "commanders", "companion",
++    "maybeboard", "maybe", "considering", "tokens", "attractions", "stickers",
++}
++_HEADER_RE = re.compile(r"^([A-Za-z ]+?)\s*(?:\(\d+\))?\s*:?$")
++
++# MTGO exports prefix sideboard lines with "SB:".
++_SB_PREFIX_RE = re.compile(r"^SB:\s*", re.IGNORECASE)
++
++
++@dataclass
++class ParseResult:
++    cards: List[Dict] = field(default_factory=list)
++    # Each entry: {'line': original text, 'reason': why it was skipped}
++    skipped: List[Dict] = field(default_factory=list)
++
++
++def _strip_decorations(name: str) -> str:
++    changed = True
++    while changed:
++        changed = False
++        for pattern in _TRAILING_PATTERNS:
++            new_name = pattern.sub("", name)
++            if new_name != name:
++                name = new_name.rstrip()
++                changed = True
++    return name.strip()
++
++
++def parse_decklist_detailed(decklist_text: str) -> ParseResult:
+     """
+-    Parses a raw decklist string into a list of card queries.
++    Parse a raw decklist into card queries and report lines that could not be read.
+ 
+     Handles formats like:
+-    - 1x Sol Ring
+-    - 4 Command Tower
+-    - Sol Ring
+-    - Sol Ring (SET) 123
++    - 1x Sol Ring / 4 Command Tower / Sol Ring
++    - 1 High Tide (FEM) 18b
++    - 1 Loki, God of Mischief (PMEI) 2026-14 *F*
++    - SB: 2 Pyroblast
++    - Section headers such as "Deck", "Sideboard", "Commander (1)"
+ 
+-    Returns a list of dictionaries, e.g., [{'quantity': '1', 'name': 'Sol Ring'}]
++    Duplicate names (e.g. the same card in two sections) are merged by adding
++    their quantities. Each card dict looks like
++    {'quantity': 2, 'name': 'Sol Ring', 'lines': ['1 Sol Ring', '1x Sol Ring (C21) 263']}.
+     """
+-    # This regex captures:
+-    # - Group 1 (Optional): A number, possibly followed by 'x' and whitespace.
+-    # - Group 2: The card name, which can contain any characters. We capture it lazily (.*?)
+-    # - A non-capturing group for the optional set/collector info, which we discard.
+-    card_pattern = re.compile(r"^\s*(\d+x?\s*)?(.*?)(?:\s\(.*\)\s*\d*)?$")
+-    
+-    parsed_cards = []
+-    lines = decklist_text.strip().split('\n')
+-
+-    for line in lines:
+-        line = line.strip()
+-        if not line or line.startswith('//'): # Skip empty lines and comments
++    result = ParseResult()
++    by_name: Dict[str, Dict] = {}
++    previous_header = None
++
++    for raw_line in decklist_text.splitlines():
++        line = raw_line.strip()
++        if not line or line.startswith("//") or line.startswith("#"):
+             continue
+ 
+-        match = card_pattern.match(line)
+-        if match:
+-            quantity_str = match.group(1)
+-            card_name = match.group(2).strip()
++        header_match = _HEADER_RE.match(line)
++        if header_match and header_match.group(1).strip().lower() in _SECTION_HEADERS:
++            previous_header = header_match.group(1).strip().lower()
++            continue
+ 
+-            if quantity_str:
+-                quantity = int(quantity_str.lower().replace('x', '').strip())
++        # MTG Arena puts "Name <deck name>" right after the "About" header.
++        if previous_header == "about" and line.lower().startswith("name "):
++            continue
++        previous_header = None
++
++        line_body = _SB_PREFIX_RE.sub("", line)
++
++        quantity = 1
++        match = _QUANTITY_RE.match(line_body)
++        if match:
++            if match.group(1) is not None:
++                quantity, name_part = int(match.group(1)), match.group(2)
+             else:
+-                quantity = 1
+-            
+-            parsed_cards.append({'quantity': quantity, 'name': card_name})
+-            
+-    return parsed_cards
+\ No newline at end of file
++                quantity, name_part = int(match.group(3)), match.group(4)
++        else:
++            name_part = line_body
++
++        name = _strip_decorations(name_part)
++
++        if not name:
++            result.skipped.append({"line": line, "reason": "No card name found on this line"})
++            continue
++        if quantity <= 0:
++            result.skipped.append({"line": line, "reason": "Quantity is zero"})
++            continue
++
++        key = name.casefold()
++        if key in by_name:
++            by_name[key]["quantity"] += quantity
++            by_name[key]["lines"].append(line)
++        else:
++            entry = {"quantity": quantity, "name": name, "lines": [line]}
++            by_name[key] = entry
++            result.cards.append(entry)
++
++    return result
++
++
++def parse_decklist(decklist_text: str) -> List[Dict]:
++    """Backwards-compatible helper that returns only the parsed card queries."""
++    return parse_decklist_detailed(decklist_text).cards
+diff --git a/requirements.txt b/requirements.txt
+index 663bd1f..fdbd682 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1,2 @@
+-requests
+\ No newline at end of file
++requests
++certifi
+-- 
+2.43.0
+

@@ -188,7 +188,7 @@ def _card_to_table_row(card: Card, quantity: str = None, row_kind: str = "card")
         "stats": stats or "—",
         "text": rules_text or "—",
         "rarity": card.rarity.title() if card.rarity else "—",
-        "price": f"€{card.price_usd}" if card.price_usd else "—",
+        "price": f"€{card.price_eur}" if card.price_eur else "—",
         "notes": note,
         "_row_kind": row_kind,
     }
@@ -378,8 +378,8 @@ def _format_card_block(card: Card, show_price: bool, show_rarity: bool) -> List[
         summary = []
         if show_rarity and card.rarity:
             summary.append(card.rarity.title())
-        if show_price and card.price_usd:
-            summary.append(f"Price: €{card.price_usd}")
+        if show_price and card.price_eur:
+            summary.append(f"Price: €{card.price_eur}")
 
         out.extend(_align_right(f"{card.quantity}x {card.name}", "   •   ".join(summary)).splitlines())
         out.append(f"  Layout: {_layout_name(card.layout)}")
@@ -398,8 +398,8 @@ def _format_card_block(card: Card, show_price: bool, show_rarity: bool) -> List[
         right_side = []
         if _should_display_colors(card):
             right_side.append(f"Colors: {_format_colors(card.colors)}")
-        if show_price and card.price_usd:
-            right_side.append(f"Price: €{card.price_usd}")
+        if show_price and card.price_eur:
+            right_side.append(f"Price: €{card.price_eur}")
 
         out.extend(_align_right(f"  {type_line}", "   •   ".join(right_side)).splitlines())
 

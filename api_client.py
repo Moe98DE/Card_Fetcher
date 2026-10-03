@@ -3,7 +3,7 @@ import json
 import os
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Tuple
 import gzip
 import tempfile
 
@@ -135,10 +135,13 @@ def _fetch_cheapest_normal_paper_eur(card_data: Dict) -> Optional[str]:
     return cheapest_text
 
 
-def fetch_card_data(card_name: str) -> Optional[Dict]:
+def lookup_card(card_name: str) -> Tuple[Optional[Dict], Optional[str]]:
     """
     Fetch card data from Scryfall and attach the cheapest regular paper EUR
     price across all printings of that card.
+
+    Returns (card_data, None) on success, or (None, reason) where reason is a
+    short human-readable explanation suitable for showing to the user.
     """
     time.sleep(0.1)  # Rate limit
 
@@ -157,27 +160,43 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
         # Store the computed value on the same object that gets cached.  A
         # value of None is intentional and means no eligible EUR price exists.
         card_data[CHEAPEST_EUR_PRICE_KEY] = _fetch_cheapest_normal_paper_eur(card_data)
-        return card_data
+        return card_data, None
 
     except requests.exceptions.HTTPError as err:
-        if err.response is not None and err.response.status_code == 404:
+        status = err.response.status_code if err.response is not None else None
+        details = None
+        if err.response is not None:
+            try:
+                details = err.response.json().get("details")
+            except ValueError:
+                details = None
+
+        if status == 404:
             print(f"Error: Card '{card_name}' not found.")
-        else:
-            print(f"HTTP Error fetching '{card_name}': {err}")
-        return None
+            # Scryfall explains e.g. "Too many cards match ambiguous name".
+            return None, details or "Card not found on Scryfall"
+
+        print(f"HTTP Error fetching '{card_name}': {err}")
+        return None, f"Scryfall returned HTTP {status}" + (f": {details}" if details else "")
 
     except requests.exceptions.SSLError as err:
         print(f"SSL Error fetching '{card_name}'.")
         _print_ssl_help(err)
-        return None
+        return None, "SSL certificate error (see console output)"
 
     except requests.exceptions.RequestException as err:
         print(f"Request Error fetching '{card_name}': {err}")
-        return None
+        return None, "Network error while contacting Scryfall"
 
     except Exception as err:
         print(f"Unexpected error fetching '{card_name}': {err}")
-        return None
+        return None, f"Unexpected error: {err}"
+
+
+def fetch_card_data(card_name: str) -> Optional[Dict]:
+    """Backwards-compatible wrapper returning only the card data (or None)."""
+    card_data, _reason = lookup_card(card_name)
+    return card_data
 
 
 def fetch_bulk_data_url() -> Optional[str]:

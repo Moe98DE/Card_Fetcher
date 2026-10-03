@@ -6,7 +6,9 @@ A simple yet powerful desktop application for Windows, Mac, and Linux that takes
 
 ## Features
 
--   **Flexible Parsing**: Accepts various decklist formats (e.g., `1x Sol Ring`, `Sol Ring`, `4 Counterspell (SET) 123`).
+-   **Flexible Parsing**: Accepts various decklist formats (e.g., `1x Sol Ring`, `Sol Ring`, `1 High Tide (FEM) 18b`, `1 Loki, God of Mischief (PMEI) 2026-14 *F*`) and exports from MTG Arena, Moxfield, Archidekt and MTGO. Duplicate entries are merged.
+-   **Skipped Card Report**: Any line that couldn't be read or found on Scryfall is listed in a dialog after processing, together with the reason.
+-   **Euro Pricing**: Shows the cheapest regular (nonfoil) paper EUR price across all printings.
 -   **Detailed Card Information**: Fetches and displays mana cost, colors, card type, full oracle text, and P/T for creatures.
 -   **Responsive GUI**: The app remains fully responsive while fetching card data in the background, with a progress bar to show its status.
 -   **Simple Interface**: A clean and intuitive UI built with Python's native Tkinter library.
@@ -20,7 +22,7 @@ To run this application, you will need Python 3 installed on your system.
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/Moe98DE/Card_Fetcher.git
-    cd mtg-deck-formatter
+    cd Card_Fetcher
     ```
 
 2.  **Create a virtual environment (recommended):**

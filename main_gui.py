@@ -4,11 +4,11 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
-from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data
+from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data, lookup_card
 from database import CardDatabase
 from formatter import build_table_rows, format_deck_as_markdown, get_table_columns
 from models import Card
-from parser import parse_decklist
+from parser import parse_decklist_detailed
 
 
 MAX_PROGRESS_UPDATES = 200
@@ -80,54 +80,68 @@ def _attach_available_meld_results(deck, db: CardDatabase, progress_queue: queue
 
 
 def build_detailed_deck(decklist_text: str, progress_queue: queue.Queue, db: CardDatabase):
+    """
+    Worker: parse the decklist, resolve each card, and report the result.
+
+    Sends ('done', deck, skipped) on success, where skipped is a list of
+    {'line': ..., 'reason': ...} dicts for every line that did not make it
+    into the deck. Sends ('error', message, skipped) if nothing could be used.
+    """
     try:
-        card_queries = parse_decklist(decklist_text)
+        parsed = parse_decklist_detailed(decklist_text)
+        skipped = list(parsed.skipped)
+        card_queries = parsed.cards
+
         if not card_queries:
-            progress_queue.put(('error', "Decklist is empty or could not be parsed."))
+            progress_queue.put(('error', "Decklist is empty or could not be parsed.", skipped))
             return
 
-        detailed_deck = []
-        processed_card_names = set()
+        # Keyed by the resolved Scryfall name so that e.g. "Delver of Secrets"
+        # and "Delver of Secrets // Insectile Aberration" become one entry.
+        cards_by_name = {}
         total_cards = len(card_queries)
 
         for i, query in enumerate(card_queries):
             current = i + 1
             input_name = query['name']
-            input_key = input_name.casefold()
-
-            if input_key in processed_card_names:
-                if _should_report_progress(current, total_cards):
-                    progress_queue.put(('progress', current, total_cards, f"Skipping {input_name} (already handled)"))
-                continue
 
             if _should_report_progress(current, total_cards):
                 progress_queue.put(('progress', current, total_cards, f"Processing: {input_name}"))
 
             # 1. Try local DB.
             scryfall_json = db.get_card(input_name)
+            reason = None
 
             # 2. Fall back to Scryfall and cache successful results.
             if not scryfall_json:
-                scryfall_json = fetch_card_data(input_name)
+                scryfall_json, reason = lookup_card(input_name)
                 if scryfall_json:
                     db.save_card(scryfall_json)
 
-            if scryfall_json:
-                card_object = Card.from_scryfall_json(scryfall_json, query['quantity'])
-                detailed_deck.append(card_object)
-                processed_card_names.add(input_key)
-                processed_card_names.add(card_object.name.casefold())
+            if not scryfall_json:
+                for line in query.get('lines') or [input_name]:
+                    skipped.append({'line': line, 'reason': reason or "Card not found"})
+                continue
+
+            resolved_key = scryfall_json.get('name', input_name).casefold()
+            existing = cards_by_name.get(resolved_key)
+            if existing:
+                existing.quantity += query['quantity']
+            else:
+                cards_by_name[resolved_key] = Card.from_scryfall_json(scryfall_json, query['quantity'])
+
+        detailed_deck = list(cards_by_name.values())
 
         if not detailed_deck:
-            progress_queue.put(('error', "No cards were found. Check the card names."))
+            progress_queue.put(('error', "No cards were found. Check the card names.", skipped))
             return
 
         # Meld results are resolved only after the whole deck is known.
         _attach_available_meld_results(detailed_deck, db, progress_queue)
-        progress_queue.put(('done', detailed_deck))
+        progress_queue.put(('done', detailed_deck, skipped))
 
     except Exception as exc:
-        progress_queue.put(('error', f"Could not process the decklist:\n{exc}"))
+        progress_queue.put(('error', f"Could not process the decklist:\n{exc}", []))
 
 
 def update_database_logic(progress_queue: queue.Queue, db: CardDatabase):
@@ -182,6 +196,7 @@ class MtgDeckFormatterApp:
         self.comm_queue = queue.Queue()
         self.worker_thread = None
         self.current_deck = []
+        self.skipped_cards = []
         self.table_rows = []
         self._table_render_generation = 0
         self.create_widgets()
@@ -319,7 +334,7 @@ class MtgDeckFormatterApp:
         text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
         text = " | ".join(part.strip() for part in text.split("\n") if part.strip())
         if len(text) > TREE_PREVIEW_LIMIT:
-            return text[:TREE_PREVIEW_LIMIT - 1].rstrip() + "&"
+            return text[:TREE_PREVIEW_LIMIT - 1].rstrip() + "…"
         return text
 
     def _set_detail_text(self, text):
@@ -344,7 +359,7 @@ class MtgDeckFormatterApp:
         for key, heading, _width in get_table_columns(show_price=True, show_rarity=True):
             value = row.get(key, "")
             if value in (None, ""):
-                value = ""
+                value = "—"
             details.append(f"{heading}: {value}")
 
         self._set_detail_text("\n\n".join(details))
@@ -411,10 +426,12 @@ class MtgDeckFormatterApp:
 
         if msg_type == 'done':
             self.current_deck = message[1]
+            self.skipped_cards = message[2] if len(message) > 2 else []
             self.table_rows = build_table_rows(self.current_deck)
             self.reset_ui_state()
-            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
             self.refresh_output_table()
+            if self.skipped_cards:
+                self.show_skipped_dialog(self.skipped_cards)
         elif msg_type == 'done_db':
             self.reset_ui_state()
             self.status_label.config(text=message[1])
@@ -423,6 +440,68 @@ class MtgDeckFormatterApp:
             self.reset_ui_state()
             self.status_label.config(text="Error occurred.")
             messagebox.showerror("Error", message[1])
+            skipped = message[2] if len(message) > 2 else []
+            if skipped:
+                self.skipped_cards = skipped
+                self.show_skipped_dialog(skipped)
+
+    def _completion_status_text(self):
+        text = f"Processing complete — {len(self.current_deck)} unique cards."
+        if self.skipped_cards:
+            count = len(self.skipped_cards)
+            text += f" {count} line{'s' if count != 1 else ''} skipped."
+        return text
+
+    def show_skipped_dialog(self, skipped):
+        """Show every skipped decklist line with the reason it was skipped."""
+        dialog = tk.Toplevel(self.root)
+        count = len(skipped)
+        dialog.title(f"{count} card{'s' if count != 1 else ''} skipped")
+        dialog.transient(self.root)
+        dialog.geometry("640x360")
+        dialog.minsize(420, 220)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"These {count} line{'s were' if count != 1 else ' was'} not added to the deck:",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 6))
+
+        report = "\n".join(f"{entry['line']}  —  {entry['reason']}" for entry in skipped)
+
+        text_box = scrolledtext.ScrolledText(frame, wrap=tk.WORD, height=10)
+        text_box.insert("1.0", report)
+        text_box.config(state=tk.DISABLED)
+        text_box.pack(fill=tk.BOTH, expand=True)
+
+        button_row = ttk.Frame(frame)
+        button_row.pack(fill=tk.X, pady=(8, 0))
+
+        copy_lines = "\n".join(entry['line'] for entry in skipped)
+
+        def copy_skipped():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(copy_lines)
+            copy_btn.config(text="Copied!")
+            dialog.after(1500, lambda: copy_btn.winfo_exists() and copy_btn.config(text="Copy Skipped Lines"))
+
+        copy_btn = ttk.Button(button_row, text="Copy Skipped Lines", command=copy_skipped)
+        copy_btn.pack(side=tk.LEFT)
+        close_btn = ttk.Button(button_row, text="Close", command=dialog.destroy)
+        close_btn.pack(side=tk.RIGHT)
+
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        close_btn.focus_set()
+
+        # Center over the main window.
+        dialog.update_idletasks()
+        width, height = 640, 360
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 3
+        dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
 
     def check_queue(self):
         """Drain pending worker messages and coalesce stale progress updates."""
@@ -501,7 +580,7 @@ class MtgDeckFormatterApp:
             self.status_label.config(text=f"Rendering table... {end_index}/{len(self.table_rows)} rows")
             self.root.after_idle(self._insert_table_rows, generation, columns, end_index)
         else:
-            self.status_label.config(text=f"Processing complete  {len(self.current_deck)} unique cards.")
+            self.status_label.config(text=self._completion_status_text())
 
     def copy_to_clipboard(self):
         if not self.current_deck:
@@ -524,6 +603,7 @@ class MtgDeckFormatterApp:
             self.input_text.delete("1.0", tk.END)
 
         self.current_deck = []
+        self.skipped_cards = []
         self.table_rows = []
         if hasattr(self, "output_tree"):
             self.refresh_output_table()

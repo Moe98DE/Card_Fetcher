@@ -82,15 +82,48 @@ class CardDatabase:
                 data TEXT
             )
         ''')
+        # Maps individual face names ("delver of secrets") to the full card
+        # name used as the primary key ("delver of secrets // insectile aberration").
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS aliases (
+                alias TEXT PRIMARY KEY,
+                name_normalized TEXT NOT NULL
+            )
+        ''')
         self.conn.commit()
+
+    @staticmethod
+    def _normalize(name: str) -> str:
+        return name.lower().strip()
+
+    @classmethod
+    def _face_aliases(cls, card_data: dict):
+        """Face names of a multi-part card that differ from its full name."""
+        full_key = cls._normalize(card_data.get('name', ''))
+        aliases = set()
+        for face in card_data.get('card_faces') or []:
+            face_name = face.get('name')
+            if face_name:
+                alias = cls._normalize(face_name)
+                if alias and alias != full_key:
+                    aliases.add(alias)
+        return aliases
 
     def get_card(self, card_name: str):
         """Returns the Dict (JSON) of the card if found, else None."""
         cursor = self.conn.cursor()
-        # Simple normalization: lowercase and stripped
-        key = card_name.lower().strip()
+        key = self._normalize(card_name)
         cursor.execute("SELECT data FROM cards WHERE name_normalized = ?", (key,))
         row = cursor.fetchone()
+
+        if not row:
+            # Fall back to a face name of a double-faced / adventure / split card.
+            cursor.execute(
+                "SELECT c.data FROM aliases a JOIN cards c ON c.name_normalized = a.name_normalized "
+                "WHERE a.alias = ?",
+                (key,),
+            )
+            row = cursor.fetchone()
 
         if row:
             card_data = json.loads(row[0])
@@ -109,7 +142,7 @@ class CardDatabase:
         if not card_data or 'name' not in card_data:
             return
 
-        key = card_data['name'].lower().strip()
+        key = self._normalize(card_data['name'])
         json_str = json.dumps(card_data)
 
         cursor = self.conn.cursor()
@@ -117,6 +150,11 @@ class CardDatabase:
             INSERT OR REPLACE INTO cards (name_normalized, data)
             VALUES (?, ?)
         ''', (key, json_str))
+        for alias in self._face_aliases(card_data):
+            cursor.execute(
+                "INSERT OR REPLACE INTO aliases (alias, name_normalized) VALUES (?, ?)",
+                (alias, key),
+            )
         self.conn.commit()
 
     def bulk_import(self, cards_list, progress_callback=None):
@@ -167,6 +205,11 @@ class CardDatabase:
                     "INSERT OR REPLACE INTO cards (name_normalized, data) VALUES (?, ?)",
                     (key, json_str)
                 )
+                for alias in self._face_aliases(card):
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO aliases (alias, name_normalized) VALUES (?, ?)",
+                        (alias, key),
+                    )
 
             if progress_callback and i % 1000 == 0:
                 progress_callback(i, total)

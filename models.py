@@ -26,7 +26,7 @@ class Card:
     name: str
     colors: List[str]
     quantity: int
-    price_usd: Optional[str] = None
+    price_eur: Optional[str] = None
     rarity: Optional[str] = None
     layout: str = "normal"
     card_faces: List[CardFace] = field(default_factory=list)
@@ -86,7 +86,9 @@ class Card:
             name=scryfall_data.get('name', 'N/A'),
             colors=scryfall_data.get('colors', []),
             quantity=quantity,
-            price_usd=scryfall_data.get('_cheapest_normal_paper_eur', scryfall_data.get('prices', {}).get('eur')),
+            # Cheapest regular (nonfoil) paper EUR price across all printings, falling
+            # back to this printing's EUR price for data cached without it.
+            price_eur=scryfall_data.get('_cheapest_normal_paper_eur', (scryfall_data.get('prices') or {}).get('eur')),
             rarity=scryfall_data.get('rarity'),
             layout=scryfall_data.get('layout', 'normal'),
             card_faces=faces,

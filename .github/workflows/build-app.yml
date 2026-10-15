@@ -1,73 +1,80 @@
-# A friendly name for your workflow, which will be displayed on GitHub
+
 name: Build MTG Deck Formatter
 
-# This section defines when the workflow will run
 on:
-  # Run it when you push to the 'main' or 'master' branch
   push:
-    branches: [ "main", "master" ]
-
-  # Allows you to run this workflow manually from the Actions tab on GitHub
+    branches: ["main", "master"]
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   build:
     strategy:
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
 
-    # The type of virtual machine to run the job on, taken from the matrix above
     runs-on: ${{ matrix.os }}
 
-    # 'steps' represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Step 1: Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Check out repository code
         uses: actions/checkout@v4
 
-      # Step 2: Sets up a Python environment on the virtual machine
-      - name: Set up Python
+      # Use setup-python only for Windows and macOS
+      - name: Set up Python (Windows/macOS)
+        if: runner.os != 'Linux'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # Step 3: Install project dependencies
-      - name: Install dependencies
+      # Linux: use Ubuntu 22.04's native Python 3.10
+      - name: Set up Linux Python environment
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-dev
+          /usr/bin/python3 --version
+          ldd --version | head -n 1
+          /usr/bin/python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install pyinstaller requests certifi
+
+      - name: Install dependencies (Windows/macOS)
+        if: runner.os != 'Linux'
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade pyinstaller requests certifi
-          pip install pyinstaller requests
+          python -m pip install pyinstaller requests certifi
 
-      # Step 4.1: Build normal Windows GUI executable
-      - name: Build with PyInstaller (Windows GUI)
+      - name: Build Windows GUI executable
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --windowed --collect-all certifi --name MtgDeckFormatter main_gui.py
+        run: >
+          python -m PyInstaller --onefile --windowed
+          --collect-all certifi
+          --name MtgDeckFormatter main_gui.py
 
-      # Step 4.2: Build Windows debug executable with console output
-      - name: Build with PyInstaller (Windows Debug Console)
+      - name: Build Windows debug executable
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --console --log-level DEBUG --collect-all certifi --name MtgDeckFormatter-debug main_gui.py
+        run: >
+          python -m PyInstaller --onefile --console
+          --log-level DEBUG --collect-all certifi
+          --name MtgDeckFormatter-debug main_gui.py
 
-      # Step 4.3: Build for macOS
-      - name: Build with PyInstaller (macOS)
+      - name: Build macOS application
         if: runner.os == 'macOS'
-        run: pyinstaller --windowed --name MtgDeckFormatter main_gui.py
+        run: >
+          python -m PyInstaller --windowed
+          --name MtgDeckFormatter main_gui.py
 
-      # Step 4.4: Build for Linux
-      - name: Build with PyInstaller (Linux)
+      - name: Build Linux executable
         if: runner.os == 'Linux'
-        run: pyinstaller --onefile --name MtgDeckFormatter main_gui.py
+        run: |
+          .venv/bin/python -m PyInstaller \
+            --onefile \
+            --name MtgDeckFormatter \
+            main_gui.py
 
-      # Step 5: Upload the built executable as a downloadable artifact
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          # Name of the artifact. We make it dynamic based on the OS.
           name: MtgDeckFormatter-${{ runner.os }}
-
-          # Path to the file(s) to upload.
-          # Windows includes both the normal GUI exe and the debug console exe.
           path: |
             dist/MtgDeckFormatter.exe
             dist/MtgDeckFormatter-debug.exe

@@ -8,6 +8,11 @@ from decimal import Decimal, InvalidOperation
 
 CHEAPEST_EUR_PRICE_KEY = "_cheapest_normal_paper_eur"
 
+# Scryfall prints some tokens with exactly the same name as a real card
+# (e.g. eternalize/embalm tokens such as "Champion of Wits"). Those objects
+# must never replace the real card or contribute to its price.
+TOKEN_LAYOUTS = {"token", "double_faced_token", "emblem", "art_series"}
+
 
 def get_app_data_path():
     """
@@ -99,6 +104,10 @@ class CardDatabase:
     @classmethod
     def _face_aliases(cls, card_data: dict):
         """Face names of a multi-part card that differ from its full name."""
+        # Art series cards ("Delver of Secrets // Delver of Secrets") and tokens
+        # must not claim the face name of a real card.
+        if card_data.get('layout') in TOKEN_LAYOUTS:
+            return set()
         full_key = cls._normalize(card_data.get('name', ''))
         aliases = set()
         for face in card_data.get('card_faces') or []:
@@ -169,11 +178,23 @@ class CardDatabase:
         cursor = self.conn.cursor()
         total = len(cards_list)
 
+        # Names that belong to at least one real (non-token) card.
+        real_card_names = {
+            card['name'].lower().strip()
+            for card in cards_list
+            if card.get('name') and card.get('layout') not in TOKEN_LAYOUTS
+        }
+
+        def shadowed_token(card):
+            """A token sharing its name with a real card; ignored entirely."""
+            return (card.get('layout') in TOKEN_LAYOUTS
+                    and card['name'].lower().strip() in real_card_names)
+
         # First pass: find the cheapest eligible EUR price for every card name.
         cheapest_by_name = {}
         for card in cards_list:
             name = card.get('name')
-            if not name:
+            if not name or shadowed_token(card):
                 continue
 
             price_info = _normal_paper_eur_price(card)
@@ -191,7 +212,7 @@ class CardDatabase:
         cursor.execute("BEGIN TRANSACTION")
 
         for i, card in enumerate(cards_list):
-            if 'name' in card:
+            if 'name' in card and not shadowed_token(card):
                 key = card['name'].lower().strip()
 
                 # Copy before adding our internal field so the downloaded list

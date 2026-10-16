@@ -1,14 +1,21 @@
 # main_gui.py
+import importlib.util
+import json
+import os
+import platform
 import queue
+import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data, lookup_card
 from database import CardDatabase
 from formatter import build_table_rows, format_deck_as_markdown, get_table_columns
 from models import Card
 from parser import parse_decklist_detailed
+import search_index
+import rules
 
 
 MAX_PROGRESS_UPDATES = 200
@@ -176,10 +183,77 @@ def update_database_logic(progress_queue: queue.Queue, db: CardDatabase):
             progress_queue.put(('db_progress', pct))
 
         db.bulk_import(data, progress_callback=import_callback)
-        progress_queue.put(('done_db', f"Successfully imported {len(data)} cards."))
+        message = f"Successfully imported {len(data)} cards."
+
+        # New: keep the Claude search index (tags + filters) in sync. Optional,
+        # so a failure here never undoes the card import above.
+        try:
+            message += "\n" + _refresh_search_index(progress_queue, db)
+        except Exception as exc:
+            message += f"\n\nThe card search index could not be updated:\n{exc}"
+
+        progress_queue.put(('done_db', message))
 
     except Exception as exc:
         progress_queue.put(('error', f"Could not update the local database:\n{exc}"))
+
+
+def _refresh_search_index(progress_queue: queue.Queue, db: CardDatabase) -> str:
+    """Download Scryfall oracle tags and rebuild the card search index."""
+    def status(text):
+        progress_queue.put(('status', text))
+
+    def tag_progress(current, total):
+        progress_queue.put(('db_progress', int(current * 100 / total) if total else 100))
+
+    search_index.ensure_schema(db.conn)
+    tag_count = search_index.update_tags_from_scryfall(db.conn, status=status, progress_callback=tag_progress)
+    status("Building card search index...")
+    indexed = search_index.rebuild_card_index(db.conn, progress_callback=tag_progress)
+    return f"Search index: {indexed} cards, {tag_count} Scryfall oracle tags."
+
+
+def update_tags_logic(progress_queue: queue.Queue, db: CardDatabase):
+    try:
+        has_cards = db.conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+        if not has_cards:
+            progress_queue.put(('error', "The local card database is empty.\n"
+                                         "Click 'Update Local DB' first; it also installs the tags."))
+            return
+        progress_queue.put(('done_db', _refresh_search_index(progress_queue, db)))
+    except Exception as exc:
+        progress_queue.put(('error', f"Could not update the Scryfall tags:\n{exc}"))
+
+
+def update_rules_logic(progress_queue: queue.Queue, db: CardDatabase, url: str = None, path: str = None):
+    """Download (or import) the Comprehensive Rules. Never exposed to Claude."""
+    try:
+        def status(text):
+            progress_queue.put(('status', text))
+
+        if path:
+            status("Importing rules file...")
+            info = rules.import_file(db.conn, path)
+        else:
+            info = rules.update_from_url(db.conn, url or None, status=status)
+        progress_queue.put(('done_db', f"Comprehensive Rules effective {info['rules_effective']} installed: "
+                                       f"{info['rules_count']} rules, {info['glossary_count']} glossary terms."))
+    except Exception as exc:
+        progress_queue.put(('error', f"Could not update the Comprehensive Rules:\n{exc}"))
+
+
+def claude_desktop_config_path() -> str:
+    if platform.system() == "Windows":
+        return os.path.join(os.getenv("APPDATA", "~"), "Claude", "claude_desktop_config.json")
+    if platform.system() == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
+    return os.path.expanduser("~/.config/Claude/claude_desktop_config.json")
+
+
+def claude_desktop_snippet() -> str:
+    server = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
+    entry = {"mcpServers": {"mtg-cards": {"command": sys.executable, "args": [server]}}}
+    return json.dumps(entry, indent=2)
 
 
 class MtgDeckFormatterApp:
@@ -250,6 +324,15 @@ class MtgDeckFormatterApp:
             command=self.refresh_output_table,
         )
         chk_rarity.pack(side=tk.LEFT, padx=5)
+
+        self.claude_button = ttk.Button(controls_frame, text="Claude Setup", command=self.show_claude_setup)
+        self.claude_button.pack(side=tk.RIGHT, padx=5)
+
+        self.rules_button = ttk.Button(controls_frame, text="Update Rules", command=self.show_rules_dialog)
+        self.rules_button.pack(side=tk.RIGHT, padx=5)
+
+        self.tags_button = ttk.Button(controls_frame, text="Update Tags", command=self.start_tags_update_thread)
+        self.tags_button.pack(side=tk.RIGHT, padx=5)
 
         self.db_button = ttk.Button(controls_frame, text="Update Local DB", command=self.start_db_update_thread)
         self.db_button.pack(side=tk.RIGHT, padx=5)
@@ -394,6 +477,7 @@ class MtgDeckFormatterApp:
 
         self._clear_comm_queue()
         self.db_button.config(state=tk.DISABLED)
+        self.tags_button.config(state=tk.DISABLED)
         self.process_button.config(state=tk.DISABLED)
         self.progress_bar['value'] = 0
 
@@ -404,6 +488,137 @@ class MtgDeckFormatterApp:
         )
         self.worker_thread.start()
         self.root.after(25, self.check_queue)
+
+    def start_tags_update_thread(self):
+        confirm = messagebox.askyesno(
+            "Update Tags",
+            "This downloads the Scryfall Tagger oracle tags (~6MB) and rebuilds the\n"
+            "card search index Claude uses. Continue?",
+        )
+        if not confirm:
+            return
+
+        self._clear_comm_queue()
+        self.db_button.config(state=tk.DISABLED)
+        self.tags_button.config(state=tk.DISABLED)
+        self.process_button.config(state=tk.DISABLED)
+        self.progress_bar['value'] = 0
+
+        self.worker_thread = threading.Thread(
+            target=update_tags_logic,
+            args=(self.comm_queue, self.db),
+            daemon=True,
+        )
+        self.worker_thread.start()
+        self.root.after(25, self.check_queue)
+
+    def _start_worker(self, target, *args):
+        self._clear_comm_queue()
+        for button in (self.db_button, self.tags_button, self.rules_button, self.process_button):
+            button.config(state=tk.DISABLED)
+        self.progress_bar['value'] = 0
+        self.worker_thread = threading.Thread(target=target, args=(self.comm_queue, self.db) + args, daemon=True)
+        self.worker_thread.start()
+        self.root.after(25, self.check_queue)
+
+    def show_rules_dialog(self):
+        """Download the latest Comprehensive Rules, a specific URL, or import a local .txt."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Comprehensive Rules")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        try:
+            meta = search_index.get_meta(self.db.conn)
+        except Exception:
+            meta = {}
+        current = (f"Installed: effective {meta['rules_effective']} ({meta.get('rules_count')} rules)"
+                   if meta.get("rules_count") else "Installed: none")
+        ttk.Label(frame, text=current).pack(anchor="w")
+        ttk.Label(frame, text=("Leave the URL empty to find the newest .txt on magic.wizards.com/rules,\n"
+                               "or paste a direct link to a MagicCompRules .txt file."),
+                  justify=tk.LEFT).pack(anchor="w", pady=(10, 4))
+        url_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=url_var, width=80).pack(fill=tk.X)
+
+        def download():
+            dialog.destroy()
+            self._start_worker(update_rules_logic, url_var.get().strip() or None, None)
+
+        def import_local():
+            path = filedialog.askopenfilename(parent=dialog, title="Choose the Comprehensive Rules .txt",
+                                              filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            if path:
+                dialog.destroy()
+                self._start_worker(update_rules_logic, None, path)
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(row, text="Download", command=download).pack(side=tk.LEFT)
+        ttk.Button(row, text="Import File...", command=import_local).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def show_claude_setup(self):
+        """Show how to connect Claude Desktop to the local card search (MCP)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Connect Claude Desktop")
+        dialog.transient(self.root)
+        dialog.geometry("760x560")
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        try:
+            meta = search_index.get_meta(self.db.conn)
+        except Exception:
+            meta = {}
+        problems = []
+        if getattr(sys, "frozen", False):
+            problems.append("You are running the packaged app. Claude Desktop needs to run "
+                            "mcp_server.py with Python from a source checkout of this project.")
+        if importlib.util.find_spec("mcp") is None:
+            problems.append(f"The 'mcp' package is not installed for this Python. Run:\n"
+                            f"  \"{sys.executable}\" -m pip install mcp")
+        if not meta.get("indexed_cards"):
+            problems.append("The search index is empty: click 'Update Local DB' (or 'Update Tags').")
+        elif not meta.get("tag_count"):
+            problems.append("No Scryfall tags installed yet: click 'Update Tags'.")
+
+        status = (f"Search index: {meta.get('indexed_cards', 0)} cards, "
+                  f"{meta.get('tag_count', 0)} oracle tags.")
+        ttk.Label(frame, text=status).pack(anchor="w")
+        for problem in problems:
+            ttk.Label(frame, text="⚠ " + problem, foreground="#b45309", wraplength=720,
+                      justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+
+        steps = (
+            "1. Open Claude Desktop → Settings → Developer → Edit Config (or open the file below).\n"
+            f"   {claude_desktop_config_path()}\n"
+            "2. Merge this into the file (keep any other servers under \"mcpServers\").\n"
+            "3. Restart Claude Desktop. The 'mtg-cards' tools appear in the tools menu.\n"
+            "   Keep this app's database updated; Claude only reads it, never the web."
+        )
+        ttk.Label(frame, text=steps, justify=tk.LEFT).pack(anchor="w", pady=(12, 6))
+
+        snippet = claude_desktop_snippet()
+        box = scrolledtext.ScrolledText(frame, height=10, wrap=tk.NONE)
+        box.insert("1.0", snippet)
+        box.config(state=tk.DISABLED)
+        box.pack(fill=tk.BOTH, expand=True)
+
+        def copy_snippet():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(snippet)
+            copy_btn.config(text="Copied!")
+            dialog.after(1500, lambda: copy_btn.config(text="Copy Config"))
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(8, 0))
+        copy_btn = ttk.Button(row, text="Copy Config", command=copy_snippet)
+        copy_btn.pack(side=tk.LEFT)
+        ttk.Button(row, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _display_transient_message(self, message):
         msg_type = message[0]
@@ -531,6 +746,9 @@ class MtgDeckFormatterApp:
     def reset_ui_state(self):
         self.process_button.config(state=tk.NORMAL)
         self.db_button.config(state=tk.NORMAL)
+        for name in ("tags_button", "rules_button"):
+            if hasattr(self, name):
+                getattr(self, name).config(state=tk.NORMAL)
         self.progress_bar['value'] = 100
 
     def refresh_output_table(self):

@@ -1,54 +1,36 @@
-# Deckbuilding with the `mtg-cards` tools
+# Guide: using the `mtg-cards` tools
 
-You have the `mtg-cards` tools, which read my local Magic database. Use them for every card, price and rules fact. **Do not use the web.** If a tool says data is missing or outdated, tell me which button to press in MTG Deck Formatter (Update Local DB / Update Tags / Update Rules) instead of guessing.
+The user gives you a commander and a Markdown table of the cards they physically own (the collection). It has full card details, so you never need tools to look up owned cards. The `mtg-cards` tools read a local card database, Scryfall function tags, EDHREC data and the Comprehensive Rules. Never use the web.
 
-## Tools
+## Scenario 1: collection only
 
-| Tool | Use it for |
-| --- | --- |
-| `database_status` | Check what's installed (cards, tags, rules version). Call once at the start. |
-| `edhrec_recommendations` | EDHREC's recommended pool for a commander. Takes an optional `theme`, `bracket` or `budget`, plus filters. |
-| `edhrec_average_deck` | EDHREC's average 99, as a baseline only. |
-| `analyze_deck` | Role counts (ramp, draw, removal, wipes, …) and recurring themes of a list. |
-| `find_tags` / `list_tags` | Turn a need ("sac outlet", "token doubler") into exact Scryfall tag slugs. Never guess slugs. |
-| `card_tags` | See which tags a card has, to find more cards like it. |
-| `search_cards` | Search all cards by tags, text, type, colour identity, mana value, price and popularity. |
-| `get_cards` | Full rules text, stats and price of specific cards. |
-| `rules_lookup` / `rules_search` / `rules_glossary` | Comprehensive Rules. Cite rule numbers when rules matter. |
+Build only from the collection. **Don't use the search or EDHREC tools.** The only exception is a rules interaction you're unsure about: check it with `rules_lookup` / `rules_search`.
 
-## Workflow
+## Scenario 2: collection + budget
 
-1. **Survey.** Call `edhrec_recommendations` for the commander with no filters. Note its themes, average type split and curve. If I gave a theme, bracket or budget, call it again with those.
-2. **Plan.** Decide the deck's game plan and role targets before picking cards. A typical starting point is ~36 lands, ~10 ramp, ~10 card advantage, ~8–10 removal (including 2–3 wipes), then synergy pieces and win conditions. Adjust to the commander.
-3. **Fill from the EDHREC pool.** Use filters (`tags_any`, `types`, `price_max`, `mv_max`, `exclude`) to fill specific roles.
-4. **Avoid a generic deck.** Don't just copy the top of the list:
-   - `sort="inclusion"` is the consensus, so use it for the core.
-   - `sort="synergy"` or `sort="lift"` finds cards specific to this commander.
-   - `search_cards(sort="deep_cut", color_identity=…)` finds strong cards that EDHREC users rarely play.
-   - Aim for a meaningful share of picks that are not in the EDHREC top inclusion list. Say which ones they are.
-5. **Check.** Run `analyze_deck` on the draft and fix any role that falls short.
-6. **Verify.** Call `get_cards` on anything you're unsure about before relying on its text.
+Owned cards cost €0. The budget is spent only on cards from outside the collection. Price every bought card with the tools (cheapest paper printing in EUR), and keep a running total that never exceeds the budget.
 
-## Constraints to respect
+1. **Build from the collection first.** Draft the best deck you can using owned cards only.
+2. **Find the holes.** Run `analyze_deck` on the draft and compare it with what the commander needs. Look for:
+   - weak roles (ramp, draw, removal, wipes, protection, recursion);
+   - curve problems;
+   - missing pieces for the theme;
+   - the specific problems the user described in a deck that didn't work.
 
-- Exactly 100 cards including the commander(s). Singleton, except basic lands and cards that say otherwise.
-- Every card is Commander-legal and inside the commander's colour identity. Always pass `color_identity` to `search_cards`.
-- **Budget:** respect it with `price_max` and the per-card prices. Prices are the cheapest paper printing in EUR from my last database update. Report the deck total.
-- **Bracket:** if I name one, respect its Game Changer limits (`game_changers="exclude"`, or count them) and avoid things outside its spirit, such as early infinite combos in low brackets.
+   Write the holes down in priority order before searching.
+3. **Turn each hole into a search.** Use `find_tags` to get exact tag slugs for the hole (never guess them). Then search two ways:
+   - `edhrec_recommendations(commander, tags_any=[...], price_max=..., exclude=<collection>)` finds proven cards for this commander that the user doesn't own.
+   - `search_cards(tags_any=[...], color_identity=<commander identity>, price_max=..., exclude=<collection + deck>)` finds options beyond EDHREC.
+4. **Fit the budget to the search strategy.**
+   - **Low budget (e.g. €10):** popular cards are often expensive or already owned. Prefer cheap cards that fill the exact hole. Useful options are `search_cards(sort="deep_cut")`, `edhrec_recommendations(sort="lift" or "synergy")` and `sort="price"`. A €0.20 card that does precisely the missing job beats a famous staple.
+   - **Larger budget:** `sort="inclusion"` / `"popular"` for proven upgrades, mixed with lift/deep-cut picks so the deck doesn't turn generic.
+   - **Spend on the biggest holes first.** Each purchase should replace the weakest card in the draft, so name the cut for every add.
+5. **Verify before committing.** Call `get_cards` on bought cards whose text matters. Run `analyze_deck` again on the final list.
 
-## Output
+## Tool notes
 
-1. A short summary of the game plan and how the deck wins.
-2. The decklist grouped by type, with role counts, the total price, and the number of Game Changers.
-3. Notable non-generic picks, one line each on why.
-4. If you're improving an existing deck: cuts and adds as pairs, with reasons.
-5. The full list as a plain decklist (`1 Card Name` per line), so I can paste it into MTG Deck Formatter or Moxfield.
-
-## This task
-
-- Commander:
-- Theme / strategy:
-- Budget (EUR, total or per card):
-- Bracket:
-- Must include / must avoid:
-- Current decklist (if upgrading):
+- `edhrec_recommendations` with no filters also returns the commander's EDHREC themes, average type split and mana curve. That's a useful sanity check for the draft. Pass `theme=` when the user names one EDHREC lists.
+- `card_tags` on a card that works well in the deck shows its tags. Searching those tags finds similar cards.
+- Always pass `color_identity` to `search_cards`. Results are Commander-legal by default.
+- (GC) marks Game Changers. Count them if the user cares about brackets.
+- If a tool reports missing or outdated data, tell the user to press Update Local DB / Update Tags / Update Rules in MTG Deck Formatter. Don't work around it.

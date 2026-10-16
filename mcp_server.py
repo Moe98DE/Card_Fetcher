@@ -83,6 +83,10 @@ _search: Optional[CardSearch] = None
 def engine() -> CardSearch:
     global _search
     if _search is None:
+        import os
+        if not os.path.exists(_DB_FILE):
+            raise SearchError("No local card database yet. Open MTG Deck Formatter and click "
+                              "'Update Local DB'.")
         _search = CardSearch(si.connect(_DB_FILE, read_only=True))
     return _search
 

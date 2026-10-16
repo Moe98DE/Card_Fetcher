@@ -250,9 +250,29 @@ def claude_desktop_config_path() -> str:
     return os.path.expanduser("~/.config/Claude/claude_desktop_config.json")
 
 
+MCP_EXE_NAME = "MtgCardsMCP.exe" if platform.system() == "Windows" else "MtgCardsMCP"
+
+
+def packaged_mcp_executable():
+    """In the packaged app, find the bundled MtgCardsMCP server executable (or None)."""
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    candidates = [os.path.join(exe_dir, MCP_EXE_NAME)]
+    if platform.system() == "Darwin" and exe_dir.endswith(os.path.join("Contents", "MacOS")):
+        app_parent = os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
+        candidates.append(os.path.join(app_parent, MCP_EXE_NAME))  # next to the .app
+    return next((c for c in candidates if os.path.isfile(c)), None)
+
+
 def claude_desktop_snippet() -> str:
-    server = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
-    entry = {"mcpServers": {"mtg-cards": {"command": sys.executable, "args": [server]}}}
+    if getattr(sys, "frozen", False):
+        # Windowed apps have no stdin/stdout on Windows, so Claude Desktop talks to
+        # the separate console executable that ships next to the app.
+        command = packaged_mcp_executable() or os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), MCP_EXE_NAME)
+        entry = {"mcpServers": {"mtg-cards": {"command": command, "args": []}}}
+    else:
+        server = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
+        entry = {"mcpServers": {"mtg-cards": {"command": sys.executable, "args": [server]}}}
     return json.dumps(entry, indent=2)
 
 
@@ -576,9 +596,10 @@ class MtgDeckFormatterApp:
             meta = {}
         problems = []
         if getattr(sys, "frozen", False):
-            problems.append("You are running the packaged app. Claude Desktop needs to run "
-                            "mcp_server.py with Python from a source checkout of this project.")
-        if importlib.util.find_spec("mcp") is None:
+            if not packaged_mcp_executable():
+                problems.append(f"{MCP_EXE_NAME} was not found next to this app. It is part of the same "
+                                f"build download; put it in the same folder as the app.")
+        elif importlib.util.find_spec("mcp") is None:
             problems.append(f"The 'mcp' package is not installed for this Python. Run:\n"
                             f"  \"{sys.executable}\" -m pip install mcp")
         if not meta.get("indexed_cards"):

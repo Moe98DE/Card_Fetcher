@@ -95,23 +95,32 @@ EDHREC is unreachable an older cached copy is used. Claude itself never browses.
 
 ### Setup
 
-1.  Install the optional dependency in the same environment you run the app with:
-    `pip install mcp`
-2.  In the app, click **Update Local DB** (this now also downloads the Scryfall
-    oracle tags, ~6MB) or, if your card database is already current, just
-    **Update Tags**.
-3.  Click **Claude Setup**, copy the config snippet into Claude Desktop's
-    `claude_desktop_config.json` (Settings → Developer → Edit Config), and
-    restart Claude Desktop. The `mtg-cards` tools then show up in the tools menu.
+**Packaged app:** each build also contains `MtgCardsMCP` (`MtgCardsMCP.exe` on
+Windows), a small console program that serves the tools. Keep it in the same
+folder as the app (on macOS, next to `MtgDeckFormatter.app`). Packaged
+windowed apps can't talk to Claude Desktop directly, so Claude Desktop launches
+this program instead. It reads the same local database as the app.
+
+**From source:** `pip install mcp` in the environment you run the app with.
+
+Then, either way:
+
+1.  In the app, click **Update Local DB** (this also downloads the Scryfall oracle
+    tags, ~6MB) or, if your card database is already current, just **Update Tags**.
+    Optionally click **Update Rules**.
+2.  Click **Claude Setup**, copy the config snippet into Claude Desktop's
+    `claude_desktop_config.json` (Settings → Developer → Edit Config), and restart
+    Claude Desktop. The `mtg-cards` tools then show up in the tools menu.
+
+On macOS, if Claude Desktop can't start `MtgCardsMCP` because it was downloaded
+from the internet, run `xattr -d com.apple.quarantine /path/to/MtgCardsMCP` once.
 
 If HTTPS requests fail because something on your network intercepts TLS (see
 the SSL notes in `api_client.py`), add
 `"env": {"REQUESTS_CA_BUNDLE": "C:\\path\\to\\combined-ca-bundle.pem"}` to the
 `mtg-cards` entry in the Claude Desktop config.
 
-The packaged executable can't act as the server; Claude Desktop runs
-`mcp_server.py` with Python from a source checkout. Headless refresh is also
-possible with `python search_index.py`.
+Headless refresh is also possible with `python search_index.py`.
 
 New modules: `search_index.py` (tag import and search index), `card_search.py`
 (search engine, usable without MCP), `edhrec.py` (EDHREC fetch, parse and cache),

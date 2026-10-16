@@ -53,7 +53,8 @@ jobs:
           .venv/bin/python -m pip install \
             pyinstaller \
             requests \
-            certifi
+            certifi \
+            mcp
 
           # Verify Tkinter inside virtual environment
           .venv/bin/python -c "import tkinter; print('Tkinter available in venv')"
@@ -63,7 +64,7 @@ jobs:
         if: runner.os != 'Linux'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller requests certifi
+          python -m pip install pyinstaller requests certifi mcp
 
       # Step 5.1: Build Windows GUI executable
       - name: Build Windows GUI
@@ -114,6 +115,44 @@ jobs:
             --name MtgDeckFormatter \
             main_gui.py
 
+      # Step 5.5: Build the Claude Desktop (MCP) server as a console executable.
+      # Windowed apps have no stdin/stdout on Windows, so Claude Desktop launches
+      # this separate executable; it shares the GUI's local database.
+      - name: Build MCP server (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: >
+          python -m PyInstaller
+          --clean
+          --onefile
+          --console
+          --collect-all certifi
+          --copy-metadata mcp
+          --name MtgCardsMCP
+          mcp_server.py
+
+      - name: Build MCP server (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          .venv/bin/python -m PyInstaller \
+            --clean \
+            --onefile \
+            --console \
+            --collect-all certifi \
+            --copy-metadata mcp \
+            --name MtgCardsMCP \
+            mcp_server.py
+
+      - name: Smoke-test MCP server
+        shell: bash
+        run: |
+          # The server must start and answer an MCP initialize request over stdio.
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=dist/MtgCardsMCP.exe; else BIN=dist/MtgCardsMCP; fi
+          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+          RESP=$( (echo "$REQ"; sleep 8) | "$BIN" 2>/dev/null | head -n 1 )
+          echo "$RESP"
+          echo "$RESP" | grep -q '"mtg-cards"'
+
       # Step 6: Check Linux build
       - name: Verify Linux executable
         if: runner.os == 'Linux'
@@ -142,5 +181,7 @@ jobs:
           path: |
             dist/MtgDeckFormatter.exe
             dist/MtgDeckFormatter-debug.exe
+            dist/MtgCardsMCP.exe
+            dist/MtgCardsMCP
             dist/MtgDeckFormatter.app/
             dist/MtgDeckFormatter

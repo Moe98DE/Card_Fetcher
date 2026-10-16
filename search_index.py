@@ -37,6 +37,10 @@ NON_CARD_LAYOUTS = {
 
 ProgressCallback = Optional[Callable[[int, int], None]]
 
+# Where rules.py stores the Comprehensive Rules text (readers only need the path).
+import os as _os
+RULES_TEXT_FILE = _os.path.join(_os.path.dirname(DB_FILE), "comprehensive_rules.txt")
+
 
 # ---------------------------------------------------------------------------
 # Connection / schema

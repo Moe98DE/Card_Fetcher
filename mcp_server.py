@@ -65,6 +65,13 @@ Suggested workflow when improving a deck:
    which is how you find non-generic picks. Text search (text=...) works when
    no tag fits.
 4. get_cards for the full rules text of finalists before recommending them.
+Rules questions: the Magic Comprehensive Rules are stored locally. Use
+rules_lookup for a rule number or keyword name (e.g. '702.19' or 'Ward'),
+rules_search to find which rules cover something, and rules_glossary for
+terms. Cite rule numbers. The full text is also the resource
+rules://comprehensive-rules. You cannot download rules; if they are missing or
+outdated, tell the user to click 'Update Rules' in MTG Deck Formatter.
+
 Prices are the cheapest regular paper EUR price across printings, from the
 last database update. EDHREC pages are cached locally for 7 days.
 """
@@ -141,9 +148,14 @@ def database_status() -> str:
     def when(ts):
         return dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M") if ts else "never"
 
+    rs = engine().rules_status()
+    rules_line = (f"Comprehensive Rules: effective {rs['rules_effective']}, {rs['rules_count']} rules, "
+                  f"{rs['glossary_count']} glossary terms (installed {when(rs['rules_updated_at'])})"
+                  if rs.get("rules_count") else "Comprehensive Rules: not installed")
     return (f"Indexed cards: {st['indexed_cards']} (index built {when(st['index_built_at'])})\n"
             f"Oracle tags: {st['tag_count']} (updated {when(st['tags_updated_at'])})\n"
-            f"Full-text search: {'yes' if st['full_text'] else 'no (LIKE fallback)'}")
+            f"Full-text search: {'yes' if st['full_text'] else 'no (LIKE fallback)'}\n"
+            f"{rules_line}")
 
 
 @_tool()
@@ -437,6 +449,88 @@ def edhrec_average_deck(
     for note in deck["notes"]:
         out.append(f"Note: {note}")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive Rules (read-only)
+# ---------------------------------------------------------------------------
+
+def _rule_line(number: str, kind: str, text: str) -> str:
+    sep = "." if kind in ("chapter", "section", "rule") else ""
+    return f"{number}{sep} {text}"
+
+
+@_tool()
+@_guard
+def rules_lookup(
+    rule: Annotated[str, Field(description=(
+        "A rule number ('702.19', '704.5k', '903'), a chapter ('7'), or the name of a keyword / "
+        "section ('Trample', 'Ward', 'Commander').") )],
+) -> str:
+    """Read the Magic Comprehensive Rules: a rule with all its subrules and examples, or the
+    list of rules in a section / sections in a chapter."""
+    res = engine().rules_lookup(rule)
+    e = res["entry"]
+    out = []
+    if res["breadcrumb"]:
+        out.append(" › ".join(res["breadcrumb"]))
+    out.append(_rule_line(e["number"], e["kind"], e["text"]))
+    if res["children"]:
+        out.append("")
+        for c in res["children"]:
+            text = c["text"] if res["full_children"] or c["kind"] == "section" \
+                else c["text"].splitlines()[0][:160]
+            out.append(_rule_line(c["number"], c["kind"], text))
+        if not res["full_children"]:
+            out.append("\n(Use rules_lookup on a number above for its full text.)")
+    if res["more"]:
+        out.append(f"... {res['more']} more")
+    return "\n".join(out)
+
+
+@_tool()
+@_guard
+def rules_search(
+    query: Annotated[str, Field(description=(
+        "Key terms to find in the Comprehensive Rules, e.g. 'commander tax', 'deathtouch trample', "
+        "'\"state-based actions\" legend'. Few specific words work best."))],
+    limit: Annotated[int, Field(ge=1, le=50)] = 12,
+    include_glossary: bool = True,
+) -> str:
+    """Search the Magic Comprehensive Rules and glossary; returns matching rule numbers with text."""
+    hits = engine().rules_search(query, limit=limit, include_glossary=include_glossary)
+    if not hits:
+        return f"No rules matched '{query}'. Try other key terms or rules_glossary."
+    out = []
+    for h in hits:
+        if h["kind"] == "glossary":
+            term, _, definition = h["text"].partition("\n")
+            out.append(f"- Glossary · **{term}**: {_cell(definition, 300)}")
+        else:
+            out.append(f"- **{h['number']}** {_cell(h['text'], 300)}")
+    return "\n".join(out) + "\n\nUse rules_lookup with a number for the full rule and its subrules."
+
+
+@_tool()
+@_guard
+def rules_glossary(
+    term: Annotated[str, Field(description="A game term, e.g. 'Mana Value', 'Legend Rule', 'Commander Tax'.")],
+) -> str:
+    """Look a term up in the Comprehensive Rules glossary."""
+    hits = engine().rules_glossary(term)
+    if not hits:
+        return f"'{term}' is not in the glossary. Try rules_search."
+    return "\n\n".join(f"**{h['term']}**\n{h['definition']}" for h in hits)
+
+
+@mcp.resource("rules://comprehensive-rules", name="Magic Comprehensive Rules",
+              description="The full Magic: The Gathering Comprehensive Rules text stored by MTG Deck Formatter.",
+              mime_type="text/plain")
+def comprehensive_rules_text() -> str:
+    try:
+        return engine().rules_text()
+    except SearchError as err:
+        return str(err)
 
 
 # ---------------------------------------------------------------------------

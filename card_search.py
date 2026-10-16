@@ -9,6 +9,7 @@ Every function only reads the local SQLite cache; nothing touches the network.
 import difflib
 import json
 import math
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -676,6 +677,98 @@ class CardSearch:
         deck.update(sections=priced_sections, total_price=total_price, unpriced=unpriced,
                     card_count=count, notes=notes)
         return deck
+
+
+    # -- Comprehensive Rules (read-only; downloading lives in rules.py) -------
+
+    def rules_status(self) -> Dict:
+        meta = si.get_meta(self.conn)
+        return {k: meta.get(k) for k in ("rules_effective", "rules_count", "glossary_count",
+                                         "rules_updated_at", "rules_file")}
+
+    def _require_rules(self) -> None:
+        try:
+            n = self.conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+        except sqlite3.OperationalError:
+            n = 0
+        if not n:
+            raise SearchError("The Comprehensive Rules are not installed. Open MTG Deck Formatter "
+                              "and click 'Update Rules'.")
+
+    def rules_lookup(self, ref: str, max_children: int = 200) -> Dict:
+        """A rule with all its subrules, a section's rule list, a chapter's sections,
+        or a rule found by its title (e.g. 'Trample', 'Ward')."""
+        self._require_rules()
+        ref = (ref or "").strip().rstrip(".")
+        row = self.conn.execute("SELECT number, kind, parent, text FROM rules WHERE number = ?",
+                                (ref.lower() if re.match(r"^\d", ref) else ref,)).fetchone()
+        if row is None and not re.match(r"^\d", ref):
+            # By title: keyword/section names are the whole text of rules like '702.19. Trample'.
+            row = self.conn.execute(
+                "SELECT number, kind, parent, text FROM rules WHERE kind IN ('chapter','section','rule') "
+                "AND lower(text) = lower(?) ORDER BY ord LIMIT 1", (ref,)).fetchone()
+        if row is None:
+            raise SearchError(f"No rule '{ref}'. Use rules_search to find the right rule number.")
+
+        entry = dict(row)
+        children = [dict(r) for r in self.conn.execute(
+            "SELECT number, kind, text FROM rules WHERE parent = ? ORDER BY ord", (entry["number"],))]
+        # Subrules of a rule are shown in full; a section/chapter lists its children.
+        full_children = entry["kind"] in ("rule", "subrule")
+        breadcrumb = []
+        parent = entry["parent"]
+        while parent:
+            p = self.conn.execute("SELECT number, text, parent FROM rules WHERE number = ?", (parent,)).fetchone()
+            if not p:
+                break
+            breadcrumb.insert(0, f"{p[0]}. {p[1].splitlines()[0]}")
+            parent = p[2]
+        return {"entry": entry, "children": children[:max_children], "more": max(0, len(children) - max_children),
+                "full_children": full_children, "breadcrumb": breadcrumb}
+
+    def rules_search(self, query: str, limit: int = 15, include_glossary: bool = True) -> List[Dict]:
+        self._require_rules()
+        limit = max(1, min(limit, 50))
+        if si.get_meta(self.conn).get("rules_fts") == "1":
+            where = "" if include_glossary else "AND kind != 'glossary'"
+            sql = (f"SELECT number, kind, text FROM rules_fts WHERE rules_fts MATCH ? {where} "
+                   f"ORDER BY bm25(rules_fts) LIMIT ?")
+            rows = self.conn.execute(sql, (_fts_query(query), limit)).fetchall()
+            if not rows:
+                # Nothing contains every term: rank rules containing any of them instead.
+                terms = [t for t in re.findall(r'"[^"]+"|[\w\']+', query) if t.upper() not in ("OR", "AND")]
+                loose = " OR ".join('"' + re.sub(r'["]', "", t) + '"' for t in terms)
+                if loose:
+                    rows = self.conn.execute(sql, (loose, limit)).fetchall()
+        else:
+            words = re.findall(r"\w+", query.lower())
+            cond = " AND ".join("lower(text) LIKE ?" for _ in words) or "1"
+            rows = self.conn.execute(f"SELECT number, kind, text FROM rules WHERE {cond} ORDER BY ord LIMIT ?",
+                                     [f"%{w}%" for w in words] + [limit]).fetchall()
+        return [{"number": r[0], "kind": r[1], "text": r[2]} for r in rows]
+
+    def rules_glossary(self, term: str, limit: int = 5) -> List[Dict]:
+        self._require_rules()
+        t = (term or "").strip()
+        rows = self.conn.execute("SELECT term, definition FROM glossary WHERE lower(term) = lower(?)",
+                                 (t,)).fetchall()
+        if not rows:
+            rows = self.conn.execute(
+                "SELECT term, definition FROM glossary WHERE lower(term) LIKE lower(?) ORDER BY length(term) LIMIT ?",
+                (f"%{t}%", limit)).fetchall()
+        if not rows:
+            terms = [r[0] for r in self.conn.execute("SELECT term FROM glossary")]
+            close = difflib.get_close_matches(t, terms, n=limit, cutoff=0.6)
+            rows = [self.conn.execute("SELECT term, definition FROM glossary WHERE term = ?", (c,)).fetchone()
+                    for c in close]
+        return [{"term": r[0], "definition": r[1]} for r in rows if r]
+
+    def rules_text(self) -> str:
+        path = self.rules_status().get("rules_file") or si.RULES_TEXT_FILE
+        if not path or not os.path.exists(path):
+            raise SearchError("The Comprehensive Rules file is not installed. Click 'Update Rules' in the app.")
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
 
 
 # ---------------------------------------------------------------------------

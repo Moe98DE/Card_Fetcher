@@ -76,6 +76,18 @@ What Claude gets:
 -   **`edhrec_average_deck`**: EDHREC's average 99 for a commander, with a local
     price total, as a baseline to improve on.
 
+-   **`rules_lookup` / `rules_search` / `rules_glossary`**: read access to the
+    Magic Comprehensive Rules stored by the app: a rule with all subrules by number
+    or keyword name (`702.19`, `Ward`, `903`), a search over rules and glossary,
+    and glossary definitions. The full text is also exposed as the MCP resource
+    `rules://comprehensive-rules`.
+
+The rules are only ever downloaded by you: click **Update Rules** (leave the URL
+empty to fetch the newest `.txt` from magic.wizards.com/rules, paste a direct
+link, or import a local file), or run `python rules.py [url-or-file]`. The file
+is stored as `comprehensive_rules.txt` next to the card database (the previous
+version is kept as `.previous`). Claude has no tool to fetch rules.
+
 EDHREC has no official API; the tool requests only the page for the commander
 you name, the same JSON the EDHREC website loads, and caches it for 7 days in
 `edhrec_cache.db` next to the card database. Repeat requests are offline, and if
@@ -102,8 +114,9 @@ The packaged executable can't act as the server; Claude Desktop runs
 possible with `python search_index.py`.
 
 New modules: `search_index.py` (tag import and search index), `card_search.py`
-(search engine, usable without MCP), `edhrec.py` (EDHREC fetch, parse and cache)
-and `mcp_server.py` (the tools).
+(search engine, usable without MCP), `edhrec.py` (EDHREC fetch, parse and cache),
+`rules.py` (Comprehensive Rules download and indexing; GUI/CLI only) and
+`mcp_server.py` (the tools).
 
 ## Project Structure
 

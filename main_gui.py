@@ -7,7 +7,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from api_client import fetch_bulk_data_url, download_bulk_json, fetch_card_data, lookup_card
 from database import CardDatabase
@@ -15,6 +15,7 @@ from formatter import build_table_rows, format_deck_as_markdown, get_table_colum
 from models import Card
 from parser import parse_decklist_detailed
 import search_index
+import rules
 
 
 MAX_PROGRESS_UPDATES = 200
@@ -224,6 +225,23 @@ def update_tags_logic(progress_queue: queue.Queue, db: CardDatabase):
         progress_queue.put(('error', f"Could not update the Scryfall tags:\n{exc}"))
 
 
+def update_rules_logic(progress_queue: queue.Queue, db: CardDatabase, url: str = None, path: str = None):
+    """Download (or import) the Comprehensive Rules. Never exposed to Claude."""
+    try:
+        def status(text):
+            progress_queue.put(('status', text))
+
+        if path:
+            status("Importing rules file...")
+            info = rules.import_file(db.conn, path)
+        else:
+            info = rules.update_from_url(db.conn, url or None, status=status)
+        progress_queue.put(('done_db', f"Comprehensive Rules effective {info['rules_effective']} installed: "
+                                       f"{info['rules_count']} rules, {info['glossary_count']} glossary terms."))
+    except Exception as exc:
+        progress_queue.put(('error', f"Could not update the Comprehensive Rules:\n{exc}"))
+
+
 def claude_desktop_config_path() -> str:
     if platform.system() == "Windows":
         return os.path.join(os.getenv("APPDATA", "~"), "Claude", "claude_desktop_config.json")
@@ -309,6 +327,9 @@ class MtgDeckFormatterApp:
 
         self.claude_button = ttk.Button(controls_frame, text="Claude Setup", command=self.show_claude_setup)
         self.claude_button.pack(side=tk.RIGHT, padx=5)
+
+        self.rules_button = ttk.Button(controls_frame, text="Update Rules", command=self.show_rules_dialog)
+        self.rules_button.pack(side=tk.RIGHT, padx=5)
 
         self.tags_button = ttk.Button(controls_frame, text="Update Tags", command=self.start_tags_update_thread)
         self.tags_button.pack(side=tk.RIGHT, padx=5)
@@ -490,6 +511,54 @@ class MtgDeckFormatterApp:
         )
         self.worker_thread.start()
         self.root.after(25, self.check_queue)
+
+    def _start_worker(self, target, *args):
+        self._clear_comm_queue()
+        for button in (self.db_button, self.tags_button, self.rules_button, self.process_button):
+            button.config(state=tk.DISABLED)
+        self.progress_bar['value'] = 0
+        self.worker_thread = threading.Thread(target=target, args=(self.comm_queue, self.db) + args, daemon=True)
+        self.worker_thread.start()
+        self.root.after(25, self.check_queue)
+
+    def show_rules_dialog(self):
+        """Download the latest Comprehensive Rules, a specific URL, or import a local .txt."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Comprehensive Rules")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        try:
+            meta = search_index.get_meta(self.db.conn)
+        except Exception:
+            meta = {}
+        current = (f"Installed: effective {meta['rules_effective']} ({meta.get('rules_count')} rules)"
+                   if meta.get("rules_count") else "Installed: none")
+        ttk.Label(frame, text=current).pack(anchor="w")
+        ttk.Label(frame, text=("Leave the URL empty to find the newest .txt on magic.wizards.com/rules,\n"
+                               "or paste a direct link to a MagicCompRules .txt file."),
+                  justify=tk.LEFT).pack(anchor="w", pady=(10, 4))
+        url_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=url_var, width=80).pack(fill=tk.X)
+
+        def download():
+            dialog.destroy()
+            self._start_worker(update_rules_logic, url_var.get().strip() or None, None)
+
+        def import_local():
+            path = filedialog.askopenfilename(parent=dialog, title="Choose the Comprehensive Rules .txt",
+                                              filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            if path:
+                dialog.destroy()
+                self._start_worker(update_rules_logic, None, path)
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(row, text="Download", command=download).pack(side=tk.LEFT)
+        ttk.Button(row, text="Import File...", command=import_local).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def show_claude_setup(self):
         """Show how to connect Claude Desktop to the local card search (MCP)."""
@@ -677,8 +746,9 @@ class MtgDeckFormatterApp:
     def reset_ui_state(self):
         self.process_button.config(state=tk.NORMAL)
         self.db_button.config(state=tk.NORMAL)
-        if hasattr(self, "tags_button"):
-            self.tags_button.config(state=tk.NORMAL)
+        for name in ("tags_button", "rules_button"):
+            if hasattr(self, name):
+                getattr(self, name).config(state=tk.NORMAL)
         self.progress_bar['value'] = 100
 
     def refresh_output_table(self):

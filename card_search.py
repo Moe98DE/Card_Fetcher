@@ -69,6 +69,7 @@ class CardSearch:
         self.conn = conn or si.connect(read_only=True)
         self._tags_cache: Optional[List[Dict]] = None
         self._names_cache: Optional[Dict[str, str]] = None
+        self._edhrec_client = None
 
     # -- status -----------------------------------------------------------
 
@@ -467,6 +468,214 @@ class CardSearch:
             "common_tags": [{"slug": r[0], "count": r[1]} for r in common],
             "color_identity": "".join(c for c, b in si.COLOR_BITS.items() if identity & b) or "C",
         }
+
+
+    # -- EDHREC ---------------------------------------------------------------
+
+    def _edhrec(self):
+        if self._edhrec_client is None:
+            from edhrec import EdhrecClient
+            self._edhrec_client = EdhrecClient()
+        return self._edhrec_client
+
+    def resolve_commander(self, name: str) -> Dict:
+        """Exact card name, single face, or a loose name like 'korvold' -> canonical name."""
+        name = (name or "").strip()
+        if not name:
+            raise SearchError("No commander name given.")
+        key = self.resolve_names([name]).get(name)
+        if key:
+            row = self.conn.execute("SELECT name FROM card_index WHERE name_normalized = ?", (key,)).fetchone()
+            return {"name": row[0], "interpreted": False}
+        words = [w for w in re.findall(r"[a-z0-9']+", name.lower()) if len(w) > 1]
+        if words:
+            where = " AND ".join("name_normalized LIKE ?" for _ in words)
+            row = self.conn.execute(
+                f"SELECT name FROM card_index WHERE is_card = 1 AND {where} AND "
+                f"(type_line LIKE '%Legendary%' OR oracle_text LIKE '%can be your commander%') "
+                f"ORDER BY edhrec_rank IS NULL, edhrec_rank LIMIT 1",
+                [f"%{w}%" for w in words],
+            ).fetchone()
+            if row:
+                return {"name": row[0], "interpreted": True}
+        sugg = self.suggest_names(name)
+        raise SearchError(f"Commander '{name}' not found locally."
+                          + (f" Did you mean: {', '.join(sugg)}?" if sugg else ""))
+
+    def edhrec_recommendations(
+        self,
+        commander: str,
+        partner: Optional[str] = None,
+        theme: Optional[str] = None,
+        bracket: Optional[str] = None,
+        budget: Optional[str] = None,
+        sections: Sequence[str] = (),
+        types: Sequence[str] = (),
+        types_none: Sequence[str] = (),
+        tags_all: Sequence[str] = (),
+        tags_any: Sequence[str] = (),
+        tags_none: Sequence[str] = (),
+        price_max: Optional[float] = None,
+        mv_min: Optional[float] = None,
+        mv_max: Optional[float] = None,
+        exclude: Sequence[str] = (),
+        min_inclusion: Optional[float] = None,
+        min_synergy: Optional[float] = None,
+        include_lands: bool = True,
+        game_changers: str = "include",
+        sort: str = "inclusion",
+        limit: int = 40,
+        offset: int = 0,
+        refresh: bool = False,
+    ) -> Dict:
+        """EDHREC's recommended pool for a commander, joined with local card data and filtered."""
+        from edhrec import EdhrecError
+
+        self.require_index(need_tags=bool(tags_all or tags_any or tags_none))
+        sorts = ("inclusion", "synergy", "lift", "trend", "price", "mana_value", "name")
+        if sort not in sorts:
+            raise SearchError(f"sort must be one of {', '.join(sorts)}")
+
+        notes = []
+        commanders = []
+        for raw in [commander, partner]:
+            if raw:
+                res = self.resolve_commander(raw)
+                if res["interpreted"]:
+                    notes.append(f"Interpreted '{raw}' as {res['name']}.")
+                commanders.append(res["name"])
+        try:
+            page = self._edhrec().commander_page(commanders, theme=theme, bracket=bracket,
+                                                 budget=budget, refresh=refresh)
+        except EdhrecError as err:
+            raise SearchError(str(err)) from err
+        if page.get("stale"):
+            notes.append("EDHREC was unreachable; showing an older cached copy.")
+
+        # Join with the local index.
+        names = [c["name"] for c in page["cards"]]
+        resolved = self.resolve_names(names)
+        keys = [k for k in resolved.values() if k]
+        local = {}
+        if keys:
+            ph = ",".join("?" * len(keys))
+            for r in self.conn.execute(f"SELECT * FROM card_index WHERE name_normalized IN ({ph})", keys):
+                local[r["name_normalized"]] = dict(r)
+        unmatched = [n for n, k in resolved.items() if not k]
+
+        def tag_oracles(tag_names):
+            out = []
+            for t in self._require_tags(tag_names):
+                out.append({r[0] for r in self.conn.execute(
+                    "SELECT oracle_id FROM tag_cards WHERE tag_key = ?", (t["key"],))})
+            return out
+
+        all_sets = tag_oracles(tags_all)
+        any_set = set().union(*tag_oracles(tags_any)) if tags_any else None
+        none_set = set().union(*tag_oracles(tags_none)) if tags_none else set()
+        excluded = {k for k in self.resolve_names(exclude).values() if k} if exclude else set()
+        commander_keys = {k for k in self.resolve_names(commanders).values() if k}
+        sec_filter = [x.lower() for x in sections or []]
+        types_l = [t.lower() for t in types or []]
+        types_none_l = [t.lower() for t in types_none or []]
+
+        rows = []
+        for card in page["cards"]:
+            key = resolved.get(card["name"])
+            info = local.get(key) if key else None
+            if info is None or key in excluded or key in commander_keys:
+                continue
+            tl = (info["type_line"] or "").lower()
+            if "basic" in tl and "land" in tl:
+                continue
+            if not include_lands and "land" in tl.split("//")[0]:
+                continue
+            labels = [card["section"]] + card["labels"]
+            if sec_filter and not any(f in l.lower() for f in sec_filter for l in labels):
+                continue
+            if any(t not in tl for t in types_l) or any(t in tl for t in types_none_l):
+                continue
+            oid = info["oracle_id"]
+            if any(oid not in s_ for s_ in all_sets) or (any_set is not None and oid not in any_set) \
+                    or oid in none_set:
+                continue
+            if price_max is not None and (info["price_eur"] is None or info["price_eur"] > price_max):
+                continue
+            mv = info["mana_value"] or 0
+            if (mv_min is not None and mv < mv_min) or (mv_max is not None and mv > mv_max):
+                continue
+            incl = (card["inclusion"] or 0) * 100
+            if min_inclusion is not None and incl < min_inclusion:
+                continue
+            syn = (card["synergy"] or 0) * 100
+            if min_synergy is not None and syn < min_synergy:
+                continue
+            if game_changers == "exclude" and info["game_changer"]:
+                continue
+            if game_changers == "only" and not info["game_changer"]:
+                continue
+            rows.append({**info, "section": card["section"], "labels": card["labels"],
+                         "inclusion": incl, "synergy": syn, "lift": card["lift"],
+                         "trend": card["trend"], "num_decks": card["num_decks"]})
+
+        keyf = {
+            "inclusion": lambda r: -r["inclusion"],
+            "synergy": lambda r: -r["synergy"],
+            "lift": lambda r: -(r["lift"] or 0),
+            "trend": lambda r: -(r["trend"] or 0),
+            "price": lambda r: (r["price_eur"] is None, r["price_eur"] or 0),
+            "mana_value": lambda r: (r["mana_value"] or 0, -r["inclusion"]),
+            "name": lambda r: r["name"],
+        }[sort]
+        rows.sort(key=keyf)
+        if price_max is not None:
+            notes.append("Cards without a known EUR price are excluded when price_max is set.")
+        if unmatched:
+            notes.append(f"{len(unmatched)} EDHREC card(s) not in the local database "
+                         f"(update the local DB): " + ", ".join(unmatched[:8]))
+        limit = max(1, min(int(limit), MAX_LIMIT))
+        return {"page": page, "commanders": commanders, "total": len(rows), "offset": offset,
+                "rows": rows[offset:offset + limit], "notes": notes}
+
+    def edhrec_average_deck(self, commander: str, partner: Optional[str] = None,
+                            theme: Optional[str] = None, bracket: Optional[str] = None,
+                            budget: Optional[str] = None, refresh: bool = False) -> Dict:
+        from edhrec import EdhrecError
+
+        commanders, notes = [], []
+        for raw in [commander, partner]:
+            if raw:
+                res = self.resolve_commander(raw)
+                if res["interpreted"]:
+                    notes.append(f"Interpreted '{raw}' as {res['name']}.")
+                commanders.append(res["name"])
+        try:
+            deck = self._edhrec().average_deck(commanders, theme=theme, bracket=bracket,
+                                               budget=budget, refresh=refresh)
+        except EdhrecError as err:
+            raise SearchError(str(err)) from err
+
+        total_price, unpriced, count = 0.0, [], 0
+        priced_sections = {}
+        for section, entries in deck["sections"].items():
+            out = []
+            for name, qty in entries:
+                key = self.resolve_names([name]).get(name)
+                row = key and self.conn.execute(
+                    "SELECT price_eur, mana_value FROM card_index WHERE name_normalized = ?", (key,)).fetchone()
+                price = row[0] if row else None
+                tl_basic = section.lower() == "land" and name in ("Plains", "Island", "Swamp", "Mountain",
+                                                                    "Forest", "Wastes")
+                if price is not None:
+                    total_price += price * qty
+                elif not tl_basic:
+                    unpriced.append(name)
+                count += qty
+                out.append({"name": name, "qty": qty, "price_eur": price})
+            priced_sections[section] = out
+        deck.update(sections=priced_sections, total_price=total_price, unpriced=unpriced,
+                    card_count=count, notes=notes)
+        return deck
 
 
 # ---------------------------------------------------------------------------

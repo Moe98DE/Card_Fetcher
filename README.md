@@ -64,6 +64,22 @@ What Claude gets:
     and shows its recurring themes, so Claude can see what is missing.
 -   **`card_tags`** and **`get_cards`**: the tags of a card you like, and full card
     details in this app's Markdown table format.
+-   **`edhrec_recommendations`**: give it just a commander (loose names like
+    "korvold" work, partners too) and it fetches EDHREC's recommended pool for it,
+    optionally for a theme (`treasure`), a power bracket (`exhibition` to `cedh`)
+    or the budget/expensive pools. Every card is enriched with local mana cost,
+    type, price and rules text, and the pool can be filtered with the same tags,
+    budget, curve and type filters as `search_cards`. Sort by `inclusion`
+    (consensus), `synergy` / `lift` (commander-specific, less generic picks),
+    `trend` or `price`. It also reports the commander's themes, similar
+    commanders, average type split and mana curve.
+-   **`edhrec_average_deck`**: EDHREC's average 99 for a commander, with a local
+    price total, as a baseline to improve on.
+
+EDHREC has no official API; the tool requests only the page for the commander
+you name, the same JSON the EDHREC website loads, and caches it for 7 days in
+`edhrec_cache.db` next to the card database. Repeat requests are offline, and if
+EDHREC is unreachable an older cached copy is used. Claude itself never browses.
 
 ### Setup
 
@@ -76,12 +92,18 @@ What Claude gets:
     `claude_desktop_config.json` (Settings → Developer → Edit Config), and
     restart Claude Desktop. The `mtg-cards` tools then show up in the tools menu.
 
+If HTTPS requests fail because something on your network intercepts TLS (see
+the SSL notes in `api_client.py`), add
+`"env": {"REQUESTS_CA_BUNDLE": "C:\\path\\to\\combined-ca-bundle.pem"}` to the
+`mtg-cards` entry in the Claude Desktop config.
+
 The packaged executable can't act as the server; Claude Desktop runs
 `mcp_server.py` with Python from a source checkout. Headless refresh is also
 possible with `python search_index.py`.
 
 New modules: `search_index.py` (tag import and search index), `card_search.py`
-(offline search engine, usable without MCP) and `mcp_server.py` (the tools).
+(search engine, usable without MCP), `edhrec.py` (EDHREC fetch, parse and cache)
+and `mcp_server.py` (the tools).
 
 ## Project Structure
 

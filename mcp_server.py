@@ -41,6 +41,17 @@ INSTRUCTIONS = f"""\
 Offline Magic: The Gathering card search over the user's local Scryfall database
 (Commander-focused). Use these tools instead of the web.
 
+Starting from a commander: edhrec_recommendations returns EDHREC's pool of
+recommended cards for it (inclusion % = share of that commander's decks
+running the card, synergy = how much more than in other decks of those
+colours, lift = how unusually strongly it pairs with this commander). It
+accepts the same tag / budget / curve / type filters as search_cards, plus an
+EDHREC theme, power bracket or budget tier. Pick from this pool according to
+the task (theme, budget, bracket) rather than copying the top of the list:
+sort="lift" or "synergy" surfaces commander-specific picks; sort="inclusion"
+is the generic consensus. edhrec_average_deck gives a baseline 99. Combine
+with search_cards(sort="deep_cut") for cards EDHREC users rarely play.
+
 Suggested workflow when improving a deck:
 1. analyze_deck with the current list to see colour identity, role counts
    (ramp, draw, removal, wipes, ...) and the deck's recurring themes.
@@ -55,7 +66,7 @@ Suggested workflow when improving a deck:
    no tag fits.
 4. get_cards for the full rules text of finalists before recommending them.
 Prices are the cheapest regular paper EUR price across printings, from the
-last database update.
+last database update. EDHREC pages are cached locally for 7 days.
 """
 
 mcp = _Server("mtg-cards", instructions=INSTRUCTIONS)
@@ -307,6 +318,124 @@ def analyze_deck(
         out += ["", "**Most frequent tags**", ", ".join(f"`{t['slug']}` ×{t['count']}" for t in res["common_tags"])]
     if res["unknown"]:
         out += ["", "Not found locally: " + ", ".join(res["unknown"])]
+    return "\n".join(out)
+
+
+def _pct(v) -> str:
+    return f"{v:.0f}%" if v is not None else "—"
+
+
+def _signed_pct(v) -> str:
+    return f"{v:+.0f}%" if v is not None else "—"
+
+
+def _fetched(ts) -> str:
+    import datetime as dt
+    return dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d") if ts else "?"
+
+
+@_tool()
+@_guard
+def edhrec_recommendations(
+    commander: Annotated[str, Field(description="Commander name; loose names like 'korvold' are resolved locally.")],
+    partner: Annotated[Optional[str], Field(description="Second commander (partner / background / friends forever).")] = None,
+    theme: Annotated[Optional[str], Field(description=(
+        "An EDHREC theme slug for this commander, e.g. 'sacrifice', 'treasure', 'tokens'. "
+        "The first call (no theme) lists the available themes."))] = None,
+    bracket: Annotated[Optional[Literal["exhibition", "core", "upgraded", "optimized", "cedh"]], Field(
+        description="Restrict to decks of one Commander power bracket (1-5). Cannot be combined with theme.")] = None,
+    budget: Annotated[Optional[Literal["budget", "expensive"]], Field(
+        description="EDHREC's budget or expensive deck pool.")] = None,
+    sections: Annotated[Optional[List[str]], Field(description=(
+        "Only these EDHREC lists, e.g. ['Creatures','Instants'], ['High Synergy Cards'], ['Utility Lands'], ['New Cards']."))] = None,
+    types: Annotated[Optional[List[str]], Field(description="Type-line words that must appear, e.g. ['creature'].")] = None,
+    types_none: Annotated[Optional[List[str]], Field(description="Type-line words to exclude.")] = None,
+    tags_all: Annotated[Optional[List[str]], Field(description="Scryfall oracle tag slugs the card must all have.")] = None,
+    tags_any: Annotated[Optional[List[str]], Field(description="Card must have at least one of these tags.")] = None,
+    tags_none: Annotated[Optional[List[str]], Field(description="Card must have none of these tags.")] = None,
+    price_max: Annotated[Optional[float], Field(description="Maximum EUR price (local cheapest paper printing).")] = None,
+    mv_min: Optional[float] = None,
+    mv_max: Optional[float] = None,
+    exclude: Annotated[Optional[List[str]], Field(description="Card names to leave out, usually the current decklist.")] = None,
+    min_inclusion: Annotated[Optional[float], Field(description="Minimum % of this commander's decks that play the card (0-100).")] = None,
+    min_synergy: Annotated[Optional[float], Field(description="Minimum EDHREC synergy in percentage points (can be negative).")] = None,
+    include_lands: bool = True,
+    game_changers: Literal["include", "exclude", "only"] = "include",
+    sort: Annotated[Literal["inclusion", "synergy", "lift", "trend", "price", "mana_value", "name"], Field(
+        description=("inclusion: most-played with this commander. synergy: played much more with this commander "
+                     "than in other decks of its colours. lift: unusually strong commander-specific pairings "
+                     "(good for non-generic picks). trend: rising recently. price: cheapest first."))] = "inclusion",
+    limit: Annotated[int, Field(ge=1, le=MAX_LIMIT)] = 40,
+    offset: Annotated[int, Field(ge=0)] = 0,
+    refresh: Annotated[bool, Field(description="Re-download from EDHREC instead of using the 7-day local cache.")] = False,
+) -> str:
+    """EDHREC's recommended cards for a commander (optionally a theme, power bracket or budget pool),
+    enriched with local mana cost, type, price and rules text, and filterable by Scryfall tags,
+    budget and curve. Also reports the commander's themes, similar commanders and average deck shape."""
+    res = engine().edhrec_recommendations(
+        commander, partner=partner, theme=theme, bracket=bracket, budget=budget, sections=sections or [],
+        types=types or [], types_none=types_none or [], tags_all=tags_all or [], tags_any=tags_any or [],
+        tags_none=tags_none or [], price_max=price_max, mv_min=mv_min, mv_max=mv_max, exclude=exclude or [],
+        min_inclusion=min_inclusion, min_synergy=min_synergy, include_lands=include_lands,
+        game_changers=game_changers, sort=sort, limit=limit, offset=offset, refresh=refresh,
+    )
+    page, rows = res["page"], res["rows"]
+    out = [f"**{page['header']}** · {page['num_decks'] or '?'} decks on EDHREC · data from {_fetched(page['fetched_at'])}"]
+    if offset == 0:
+        if page["themes"] and not theme:
+            out.append("Themes: " + ", ".join(f"`{t['slug']}` ({t['decks']})" for t in page["themes"][:20]))
+        if page["similar"]:
+            out.append("Similar commanders: " + ", ".join(page["similar"][:6]))
+        tc = page["type_counts"]
+        if tc:
+            out.append("Average deck: " + ", ".join(f"{v} {k}" for k, v in tc.items() if v))
+        if page["mana_curve"]:
+            out.append("Average curve (nonland, by MV): " +
+                       ", ".join(f"{k}:{v}" for k, v in sorted(page["mana_curve"].items(), key=lambda x: float(x[0]))))
+    out.append("")
+    if not rows:
+        out.append(f"No recommended cards match these filters (pool after filters: {res['total']}).")
+    else:
+        out.append(f"{res['total']} recommended cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}).")
+        out += ["", "| Card | EDHREC list | Incl. | Synergy | Lift | Mana | Type | Price | Rules text |",
+                "| --- | --- | ---: | ---: | ---: | --- | --- | ---: | --- |"]
+        for r in rows:
+            name = r["name"] + (" (GC)" if r["game_changer"] else "")
+            out.append("| " + " | ".join([
+                _cell(name), _cell(r["section"]), _pct(r["inclusion"]), _signed_pct(r["synergy"]),
+                f"{r['lift']:.1f}" if r["lift"] else "—", _cell(r["mana_cost"]) or "—",
+                _cell(r["type_line"]), _price(r["price_eur"]), _cell(r["oracle_text"], 150),
+            ]) + " |")
+        if res["total"] > offset + len(rows):
+            out.append(f"\nMore: offset={offset + len(rows)}.")
+    for note in res["notes"]:
+        out.append(f"Note: {note}")
+    return "\n".join(out)
+
+
+@_tool()
+@_guard
+def edhrec_average_deck(
+    commander: Annotated[str, Field(description="Commander name; loose names are resolved locally.")],
+    partner: Optional[str] = None,
+    theme: Optional[str] = None,
+    bracket: Optional[Literal["exhibition", "core", "upgraded", "optimized", "cedh"]] = None,
+    budget: Optional[Literal["budget", "expensive"]] = None,
+    refresh: bool = False,
+) -> str:
+    """EDHREC's statistically average 99 for a commander (optionally theme / bracket / budget),
+    with local prices. A baseline to improve on, not a finished deck."""
+    deck = engine().edhrec_average_deck(commander, partner=partner, theme=theme, bracket=bracket,
+                                        budget=budget, refresh=refresh)
+    out = [f"**{deck['header']}** · {deck['card_count']} cards · ≈€{deck['total_price']:.2f} "
+           f"(local prices) · data from {_fetched(deck['fetched_at'])}"]
+    for section, cards in deck["sections"].items():
+        out.append(f"\n**{section}** ({sum(c['qty'] for c in cards)})")
+        out.append(", ".join((f"{c['qty']}x " if c["qty"] > 1 else "") + c["name"] for c in cards))
+    if deck["unpriced"]:
+        out.append("\nNo local price: " + ", ".join(deck["unpriced"]))
+    for note in deck["notes"]:
+        out.append(f"Note: {note}")
     return "\n".join(out)
 
 

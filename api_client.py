@@ -199,9 +199,12 @@ def fetch_card_data(card_name: str) -> Optional[Dict]:
     return card_data
 
 
-def fetch_bulk_data_url() -> Optional[str]:
+def fetch_bulk_data_url(bulk_type: str = "default_cards") -> Optional[str]:
     """
-    Gets the Default Cards bulk download URL from Scryfall.
+    Gets the download URL of a Scryfall bulk file (Default Cards by default).
+
+    ``bulk_type`` is Scryfall's bulk type string, e.g. "default_cards" or
+    "oracle_tags" (community function tags from Scryfall Tagger).
 
     Scryfall currently provides gzip-compressed JSON Lines using
     jsonl_download_uri. download_uri is retained as a fallback for
@@ -216,7 +219,7 @@ def fetch_bulk_data_url() -> Optional[str]:
         data = response.json()
 
         for item in data.get("data", []):
-            if item.get("type") != "default_cards":
+            if item.get("type") != bulk_type:
                 continue
 
             download_url = (
@@ -226,13 +229,13 @@ def fetch_bulk_data_url() -> Optional[str]:
 
             if not download_url:
                 print(
-                    "The default_cards entry contained neither "
+                    f"The {bulk_type} entry contained neither "
                     "jsonl_download_uri nor download_uri."
                 )
 
             return download_url
 
-        print("Could not find 'default_cards' in Scryfall bulk data response.")
+        print(f"Could not find '{bulk_type}' in Scryfall bulk data response.")
         return None
 
     except requests.exceptions.SSLError as err:

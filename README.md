@@ -43,6 +43,46 @@ To run this application, you will need Python 3 installed on your system.
     python main_gui.py
     ```
 
+## Claude Desktop Integration (Card Search for AI Deckbuilding)
+
+The app can expose your local card database to Claude Desktop as a set of
+read-only search tools (via MCP). Claude can then look for cards a deck is
+missing **without any web access**, using only your local Scryfall data.
+
+What Claude gets:
+
+-   **Scryfall Tagger oracle tags**: ~4,500 community function tags
+    (`sacrifice-outlet`, `token-doubler`, `sweeper`, ...). Broad tags include
+    all their narrower child tags, so `removal` really means all removal.
+-   **`find_tags` / `list_tags`**: turn a need ("board wipe", "graveyard hate")
+    into exact tag slugs, or browse the whole tag catalogue.
+-   **`search_cards`**: filter by tags, rules text, type, colour identity, mana
+    value, EUR budget, rarity, Game Changer status, and exclude the current list.
+    Sort by `popular` (EDHREC staples first) or `deep_cut` (hides the most-played
+    EDHREC cards and shows the best of the rest) plus price, mana value or random.
+-   **`analyze_deck`**: counts ramp, draw, removal, wipes, tutors etc. in a list
+    and shows its recurring themes, so Claude can see what is missing.
+-   **`card_tags`** and **`get_cards`**: the tags of a card you like, and full card
+    details in this app's Markdown table format.
+
+### Setup
+
+1.  Install the optional dependency in the same environment you run the app with:
+    `pip install mcp`
+2.  In the app, click **Update Local DB** (this now also downloads the Scryfall
+    oracle tags, ~6MB) or, if your card database is already current, just
+    **Update Tags**.
+3.  Click **Claude Setup**, copy the config snippet into Claude Desktop's
+    `claude_desktop_config.json` (Settings → Developer → Edit Config), and
+    restart Claude Desktop. The `mtg-cards` tools then show up in the tools menu.
+
+The packaged executable can't act as the server; Claude Desktop runs
+`mcp_server.py` with Python from a source checkout. Headless refresh is also
+possible with `python search_index.py`.
+
+New modules: `search_index.py` (tag import and search index), `card_search.py`
+(offline search engine, usable without MCP) and `mcp_server.py` (the tools).
+
 ## Project Structure
 
 The application is designed to be modular and scalable:

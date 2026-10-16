@@ -1,2 +1,4 @@
 requests
 certifi
+# Optional: only needed for the Claude Desktop integration (mcp_server.py)
+mcp

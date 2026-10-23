@@ -43,13 +43,14 @@ To run this application, you will need Python 3 installed on your system.
     python main_gui.py
     ```
 
-## Claude Desktop Integration (Card Search for AI Deckbuilding)
+## OpenAI Codex and Claude Integration (Card Search for AI Deckbuilding)
 
-The app can expose your local card database to Claude Desktop as a set of
-read-only search tools (via MCP). Claude can then look for cards a deck is
-missing **without any web access**, using only your local Scryfall data.
+The app exposes the same MCP tools to OpenAI Codex, Claude Desktop, and Claude
+Code over **stdio**. Card and rules searches use only your local Scryfall data;
+EDHREC tools can fetch public recommendations and cache them locally. No OpenAI
+or Anthropic API key is needed by this server. Both clients can use it at once.
 
-What Claude gets:
+What each client gets:
 
 -   **Scryfall Tagger oracle tags**: ~4,500 community function tags
     (`sacrifice-outlet`, `token-doubler`, `sweeper`, ...). Broad tags include
@@ -61,7 +62,7 @@ What Claude gets:
     Sort by `popular` (EDHREC staples first) or `deep_cut` (hides the most-played
     EDHREC cards and shows the best of the rest) plus price, mana value or random.
 -   **`analyze_deck`**: counts ramp, draw, removal, wipes, tutors etc. in a list
-    and shows its recurring themes, so Claude can see what is missing.
+    and shows its recurring themes, so the assistant can see what is missing.
 -   **`card_tags`** and **`get_cards`**: the tags of a card you like, and full card
     details in this app's Markdown table format.
 -   **`edhrec_recommendations`**: give it just a commander (loose names like
@@ -86,19 +87,19 @@ The rules are only ever downloaded by you: click **Update Rules** (leave the URL
 empty to fetch the newest `.txt` from magic.wizards.com/rules, paste a direct
 link, or import a local file), or run `python rules.py [url-or-file]`. The file
 is stored as `comprehensive_rules.txt` next to the card database (the previous
-version is kept as `.previous`). Claude has no tool to fetch rules.
+version is kept as `.previous`). The MCP server has no tool to fetch rules.
 
 EDHREC has no official API; the tool requests only the page for the commander
 you name, the same JSON the EDHREC website loads, and caches it for 7 days in
 `edhrec_cache.db` next to the card database. Repeat requests are offline, and if
-EDHREC is unreachable an older cached copy is used. Claude itself never browses.
+EDHREC is unreachable an older cached copy is used. The server performs these requests; the client does not need a browser tool.
 
 ### Setup
 
 **Packaged app:** each build also contains `MtgCardsMCP` (`MtgCardsMCP.exe` on
 Windows), a small console program that serves the tools. Keep it in the same
 folder as the app (on macOS, next to `MtgDeckFormatter.app`). Packaged
-windowed apps can't talk to Claude Desktop directly, so Claude Desktop launches
+windowed apps can't serve MCP over stdio directly, so each client launches
 this program instead. It reads the same local database as the app.
 
 **From source:** `pip install mcp` in the environment you run the app with.
@@ -108,9 +109,66 @@ Then, either way:
 1.  In the app, click **Update Local DB** (this also downloads the Scryfall oracle
     tags, ~6MB) or, if your card database is already current, just **Update Tags**.
     Optionally click **Update Rules**.
-2.  Click **Claude Setup**, copy the config snippet into Claude Desktop's
-    `claude_desktop_config.json` (Settings → Developer → Edit Config), and restart
-    Claude Desktop. The `mtg-cards` tools then show up in the tools menu.
+2.  Choose **Codex Setup** or **Claude Setup** and follow the client instructions
+    below. Both buttons generate absolute paths for this installation, for either
+    the packaged server or your current Python environment. They only copy text;
+    they do not overwrite either client's settings.
+
+### OpenAI Codex (app, CLI, and IDE extension)
+
+Click **Codex Setup** and merge the generated TOML into `~/.codex/config.toml`
+(or `$CODEX_HOME/config.toml` when set). You can instead use a trusted project's
+`.codex/config.toml`. Replace any existing `[mcp_servers.mtg-cards]` table rather
+than duplicating it, and keep your other settings.
+
+Example for a source installation (replace paths with your own):
+
+```toml
+[mcp_servers.mtg-cards]
+command = "/absolute/path/Card_Fetcher/venv/bin/python"
+args = ["/absolute/path/Card_Fetcher/mcp_server.py"]
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+```
+
+On Windows use the virtual environment's `Scripts/python.exe`. TOML paths can
+use forward slashes, such as `C:/Card_Fetcher/venv/Scripts/python.exe`; the setup
+button also handles escaped backslashes. For packaged builds, `command` is the
+absolute path to `MtgCardsMCP.exe` (Windows) or `MtgCardsMCP` (macOS/Linux), and
+`args = []`. The longer timeouts allow packaged startup and EDHREC requests.
+
+Alternatively, register a source installation with the Codex CLI:
+
+```sh
+codex mcp add mtg-cards -- /absolute/path/venv/bin/python /absolute/path/Card_Fetcher/mcp_server.py
+codex mcp list
+```
+
+Restart Codex after changing configuration. Ask it to call `database_status`,
+then `search_cards` with `text="Sol Ring"`. In the CLI, `/mcp` shows the connection.
+A missing database does not prevent connection: the tools explain how to install
+it. See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+
+### Claude Desktop and Claude Code
+
+The existing **Claude Setup** workflow is unchanged: merge its JSON snippet into
+Claude Desktop's `claude_desktop_config.json` (Settings → Developer → Edit Config),
+keeping other entries under `mcpServers`, then restart Claude Desktop.
+
+Claude Code can use the same command/args entry in a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "mtg-cards": {
+      "command": "/absolute/path/venv/bin/python",
+      "args": ["/absolute/path/Card_Fetcher/mcp_server.py"]
+    }
+  }
+}
+```
+
+### Troubleshooting
 
 On macOS, if Claude Desktop can't start `MtgCardsMCP` because it was downloaded
 from the internet, run `xattr -d com.apple.quarantine /path/to/MtgCardsMCP` once.
@@ -118,7 +176,19 @@ from the internet, run `xattr -d com.apple.quarantine /path/to/MtgCardsMCP` once
 If HTTPS requests fail because something on your network intercepts TLS (see
 the SSL notes in `api_client.py`), add
 `"env": {"REQUESTS_CA_BUNDLE": "C:\\path\\to\\combined-ca-bundle.pem"}` to the
-`mtg-cards` entry in the Claude Desktop config.
+`mtg-cards` entry in the Claude Desktop config. For Codex, add:
+
+```toml
+[mcp_servers.mtg-cards.env]
+REQUESTS_CA_BUNDLE = "C:/path/to/combined-ca-bundle.pem"
+```
+
+Use the console Python executable, not `pythonw.exe`. The source interpreter must
+have `requirements.txt` installed. No working directory setting is required.
+To select a different database, append `"--db", "/absolute/path/scryfall_cache.db"`
+to the server's `args` in either client. Each client starts its own process; both
+read the same card database. Only EDHREC tools access the network, and their MCP
+annotations advertise this. All diagnostics go to stderr, leaving stdout for MCP.
 
 Headless refresh is also possible with `python search_index.py`.
 
@@ -149,3 +219,17 @@ This application relies entirely on the fantastic and free [Scryfall API](https:
 ## License
 
 This project is licensed under the MIT License - see the `LICENSE` file for details.
+## MCP compatibility tests
+
+Run the offline tests with Python 3.11+ after installing `requirements.txt`:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Python 3.10 also needs `pip install tomli` for these tests. They exercise JSON/TOML
+configuration, stdio initialization with Codex and Claude client identities,
+tool discovery, search, validation, resources, and missing-database recovery.
+They use a temporary fixture database and do not download Scryfall or EDHREC data.
+Set `MCP_SERVER_BINARY` to a built server's absolute path to test the packaged
+executable instead. CI checks both supported SDK major versions and all three OSes.

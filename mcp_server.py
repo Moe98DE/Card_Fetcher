@@ -1,7 +1,7 @@
 # mcp_server.py
 """
-MCP server that lets Claude (e.g. Claude Desktop) search your local Scryfall
-cache while building decks - without any web access.
+MCP stdio server for OpenAI Codex, Claude Desktop and other MCP clients.
+Card searches use the local Scryfall cache; EDHREC tools can fetch recommendations.
 
 It exposes read-only tools over the same SQLite database the GUI uses:
 tag discovery (Scryfall Tagger oracle tags), filtered card search with EDHREC
@@ -15,7 +15,8 @@ Run by Claude Desktop via claude_desktop_config.json, e.g.:
       "args": ["/path/to/Card_Fetcher/mcp_server.py"]
     }
 
-The GUI's "Claude Setup" button prints the exact snippet for this machine.
+The GUI's "Codex Setup" and "Claude Setup" buttons generate client-specific
+configuration for the same server. No client-specific protocol mode is needed.
 """
 import argparse
 import sys
@@ -31,15 +32,18 @@ except ImportError:  # MCP Python SDK 1.x
 try:
     from mcp.types import ToolAnnotations
     READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+    EDHREC_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 except ImportError:  # very old SDKs
-    READ_ONLY = None
+    READ_ONLY = EDHREC_READ_ONLY = None
 
 import search_index as si
 from card_search import CardSearch, SearchError, DEFAULT_DEEP_CUT_RANK, MAX_LIMIT
 
 INSTRUCTIONS = f"""\
-Offline Magic: The Gathering card search over the user's local Scryfall database
-(Commander-focused). Use these tools instead of the web.
+Magic: The Gathering card search over the user's local Scryfall database
+(Commander-focused). Card and rules searches are offline. EDHREC tools may
+fetch public recommendations and cache them locally. Prefer these tools for
+card and rules questions.
 
 Starting from a commander: edhrec_recommendations returns EDHREC's pool of
 recommended cards for it (inclusion % = share of that commander's decks
@@ -93,7 +97,9 @@ def engine() -> CardSearch:
 
 def _tool(**kw):
     if READ_ONLY is not None:
-        kw["annotations"] = READ_ONLY
+        kw.setdefault("annotations", READ_ONLY)
+    else:
+        kw.pop("annotations", None)
     return mcp.tool(**kw)
 
 
@@ -350,7 +356,7 @@ def _fetched(ts) -> str:
     return dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d") if ts else "?"
 
 
-@_tool()
+@_tool(annotations=EDHREC_READ_ONLY)
 @_guard
 def edhrec_recommendations(
     commander: Annotated[str, Field(description="Commander name; loose names like 'korvold' are resolved locally.")],
@@ -429,7 +435,7 @@ def edhrec_recommendations(
     return "\n".join(out)
 
 
-@_tool()
+@_tool(annotations=EDHREC_READ_ONLY)
 @_guard
 def edhrec_average_deck(
     commander: Annotated[str, Field(description="Commander name; loose names are resolved locally.")],
@@ -550,7 +556,7 @@ def main(argv=None):
     if args.db:
         _DB_FILE = args.db
     print(f"mtg-cards MCP server using {_DB_FILE}", file=sys.stderr)
-    mcp.run()
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

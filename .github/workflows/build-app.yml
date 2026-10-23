@@ -54,7 +54,8 @@ jobs:
             pyinstaller \
             requests \
             certifi \
-            mcp
+            mcp \
+            tomli
 
           # Verify Tkinter inside virtual environment
           .venv/bin/python -c "import tkinter; print('Tkinter available in venv')"
@@ -64,7 +65,7 @@ jobs:
         if: runner.os != 'Linux'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller requests certifi mcp
+          python -m pip install pyinstaller requests certifi mcp tomli
 
       # Step 5.1: Build Windows GUI executable
       - name: Build Windows GUI
@@ -115,8 +116,8 @@ jobs:
             --name MtgDeckFormatter \
             main_gui.py
 
-      # Step 5.5: Build the Claude Desktop (MCP) server as a console executable.
-      # Windowed apps have no stdin/stdout on Windows, so Claude Desktop launches
+      # Step 5.5: Build the Codex / Claude MCP server as a console executable.
+      # Windowed apps have no stdin/stdout on Windows, so MCP clients launch
       # this separate executable; it shares the GUI's local database.
       - name: Build MCP server (Windows/macOS)
         if: runner.os != 'Linux'
@@ -146,12 +147,16 @@ jobs:
       - name: Smoke-test MCP server
         shell: bash
         run: |
-          # The server must start and answer an MCP initialize request over stdio.
-          if [ "$RUNNER_OS" = "Windows" ]; then BIN=dist/MtgCardsMCP.exe; else BIN=dist/MtgCardsMCP; fi
-          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
-          RESP=$( (echo "$REQ"; sleep 8) | "$BIN" 2>/dev/null | head -n 1 )
-          echo "$RESP"
-          echo "$RESP" | grep -q '"mtg-cards"'
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export MCP_SERVER_BINARY="dist/MtgCardsMCP.exe"
+          else
+            export MCP_SERVER_BINARY="dist/MtgCardsMCP"
+          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            .venv/bin/python -m unittest discover -s tests -v
+          else
+            python -m unittest discover -s tests -v
+          fi
 
       # Step 6: Check Linux build
       - name: Verify Linux executable

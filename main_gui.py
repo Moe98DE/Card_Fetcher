@@ -1,8 +1,6 @@
 # main_gui.py
 import importlib.util
-import json
 import os
-import platform
 import queue
 import sys
 import threading
@@ -16,6 +14,9 @@ from models import Card
 from parser import parse_decklist_detailed
 import search_index
 import rules
+from mcp_config import (MCP_EXE_NAME, packaged_mcp_executable,
+                        claude_desktop_config_path, claude_desktop_snippet,
+                        codex_config_path, codex_snippet)
 
 
 MAX_PROGRESS_UPDATES = 200
@@ -242,40 +243,6 @@ def update_rules_logic(progress_queue: queue.Queue, db: CardDatabase, url: str =
         progress_queue.put(('error', f"Could not update the Comprehensive Rules:\n{exc}"))
 
 
-def claude_desktop_config_path() -> str:
-    if platform.system() == "Windows":
-        return os.path.join(os.getenv("APPDATA", "~"), "Claude", "claude_desktop_config.json")
-    if platform.system() == "Darwin":
-        return os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json")
-    return os.path.expanduser("~/.config/Claude/claude_desktop_config.json")
-
-
-MCP_EXE_NAME = "MtgCardsMCP.exe" if platform.system() == "Windows" else "MtgCardsMCP"
-
-
-def packaged_mcp_executable():
-    """In the packaged app, find the bundled MtgCardsMCP server executable (or None)."""
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    candidates = [os.path.join(exe_dir, MCP_EXE_NAME)]
-    if platform.system() == "Darwin" and exe_dir.endswith(os.path.join("Contents", "MacOS")):
-        app_parent = os.path.dirname(os.path.dirname(os.path.dirname(exe_dir)))
-        candidates.append(os.path.join(app_parent, MCP_EXE_NAME))  # next to the .app
-    return next((c for c in candidates if os.path.isfile(c)), None)
-
-
-def claude_desktop_snippet() -> str:
-    if getattr(sys, "frozen", False):
-        # Windowed apps have no stdin/stdout on Windows, so Claude Desktop talks to
-        # the separate console executable that ships next to the app.
-        command = packaged_mcp_executable() or os.path.join(
-            os.path.dirname(os.path.abspath(sys.executable)), MCP_EXE_NAME)
-        entry = {"mcpServers": {"mtg-cards": {"command": command, "args": []}}}
-    else:
-        server = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
-        entry = {"mcpServers": {"mtg-cards": {"command": sys.executable, "args": [server]}}}
-    return json.dumps(entry, indent=2)
-
-
 class MtgDeckFormatterApp:
     def __init__(self, root):
         self.root = root
@@ -347,6 +314,8 @@ class MtgDeckFormatterApp:
 
         self.claude_button = ttk.Button(controls_frame, text="Claude Setup", command=self.show_claude_setup)
         self.claude_button.pack(side=tk.RIGHT, padx=5)
+        self.codex_button = ttk.Button(controls_frame, text="Codex Setup", command=self.show_codex_setup)
+        self.codex_button.pack(side=tk.RIGHT, padx=5)
 
         self.rules_button = ttk.Button(controls_frame, text="Update Rules", command=self.show_rules_dialog)
         self.rules_button.pack(side=tk.RIGHT, padx=5)
@@ -581,9 +550,16 @@ class MtgDeckFormatterApp:
         ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
 
     def show_claude_setup(self):
-        """Show how to connect Claude Desktop to the local card search (MCP)."""
+        self.show_mcp_setup("claude")
+
+    def show_codex_setup(self):
+        self.show_mcp_setup("codex")
+
+    def show_mcp_setup(self, client):
+        """Show copyable configuration without changing either client config."""
+        is_codex = client == "codex"
         dialog = tk.Toplevel(self.root)
-        dialog.title("Connect Claude Desktop")
+        dialog.title("Connect OpenAI Codex" if is_codex else "Connect Claude Desktop")
         dialog.transient(self.root)
         dialog.geometry("760x560")
 
@@ -619,11 +595,20 @@ class MtgDeckFormatterApp:
             f"   {claude_desktop_config_path()}\n"
             "2. Merge this into the file (keep any other servers under \"mcpServers\").\n"
             "3. Restart Claude Desktop. The 'mtg-cards' tools appear in the tools menu.\n"
-            "   Keep this app's database updated; Claude only reads it, never the web."
+            "   Card search is local; EDHREC tools may fetch and cache recommendations."
         )
-        ttk.Label(frame, text=steps, justify=tk.LEFT).pack(anchor="w", pady=(12, 6))
+        if is_codex:
+            steps = (
+                "1. Open the Codex configuration file (create it if needed):\n"
+                f"   {codex_config_path()}\n"
+                "2. Add this TOML table; replace an existing mtg-cards table, if present.\n"
+                "   Keep your other settings and servers. Use absolute paths.\n"
+                "3. Restart Codex, then ask it to call database_status.\n"
+                "   Card search is local; EDHREC tools may fetch and cache recommendations."
+            )
+        ttk.Label(frame, text=steps, justify=tk.LEFT, wraplength=720).pack(anchor="w", pady=(12, 6))
 
-        snippet = claude_desktop_snippet()
+        snippet = codex_snippet() if is_codex else claude_desktop_snippet()
         box = scrolledtext.ScrolledText(frame, height=10, wrap=tk.NONE)
         box.insert("1.0", snippet)
         box.config(state=tk.DISABLED)

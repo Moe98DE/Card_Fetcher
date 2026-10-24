@@ -15,9 +15,12 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from pydantic import ValidationError
+
 import search_index as si
 from formatter import format_deck_as_markdown
 from models import Card
+from card_filters import CardFilters, color_clause, compile_filters, card_color_mask, numeric_stat
 
 # Cards ranked better than this on EDHREC count as "staples" for deep cuts.
 DEFAULT_DEEP_CUT_RANK = 3000
@@ -71,6 +74,9 @@ class CardSearch:
         self._tags_cache: Optional[List[Dict]] = None
         self._names_cache: Optional[Dict[str, str]] = None
         self._edhrec_client = None
+        self._formats_cache = None
+        self.conn.create_function("card_color_mask", 1, card_color_mask, deterministic=True)
+        self.conn.create_function("numeric_stat", 1, numeric_stat, deterministic=True)
 
     # -- status -----------------------------------------------------------
 
@@ -271,39 +277,44 @@ class CardSearch:
 
     # -- search -----------------------------------------------------------
 
-    def search_cards(
-        self,
-        tags_all: Sequence[str] = (),
-        tags_any: Sequence[str] = (),
-        tags_none: Sequence[str] = (),
-        text: Optional[str] = None,
-        types: Sequence[str] = (),
-        types_none: Sequence[str] = (),
-        color_identity: Optional[str] = None,
-        mv_min: Optional[float] = None,
-        mv_max: Optional[float] = None,
-        price_max: Optional[float] = None,
-        rarity: Sequence[str] = (),
-        exclude: Sequence[str] = (),
-        commander_legal: bool = True,
-        game_changers: str = "include",
-        sort: str = "popular",
-        min_edhrec_rank: Optional[int] = None,
-        max_edhrec_rank: Optional[int] = None,
-        limit: int = 25,
-        offset: int = 0,
-    ) -> Dict:
+    def _card_predicates(
+        self, *, tags_all=(), tags_any=(), tags_none=(), text=None,
+        types=(), types_none=(), color_identity=None, mv_min=None, mv_max=None,
+        price_max=None, rarity=(), exclude=(), commander_legal=True,
+        game_changers="include", filters=None,
+    ):
+        """One predicate builder for local search and EDHREC candidate pools."""
         self.require_index(need_tags=bool(tags_all or tags_any or tags_none))
-        if sort not in SORTS:
-            raise SearchError(f"sort must be one of {', '.join(SORTS)}")
+        try:
+            filters = CardFilters.model_validate(filters or {})
+            if filters.color_identity_match != "subset" and color_identity is None:
+                raise ValueError("filters.color_identity_match requires color_identity.")
+            if filters.price_known is False and price_max is not None:
+                raise ValueError("price_known=false cannot be combined with price_max.")
+            for label, low, high in (("mana value", mv_min, mv_max),
+                                     ("EUR price", filters.price_min, price_max)):
+                _validate_bounds(label, low, high)
+            if filters.legalities:
+                if self._formats_cache is None:
+                    self._formats_cache = {r[0] for r in self.conn.execute(
+                        "SELECT DISTINCT f.key FROM cards d, json_each(d.data, '$.legalities') f")}
+                unknown = set(filters.legalities) - self._formats_cache
+                if unknown:
+                    raise ValueError("Unknown format(s): " + ", ".join(sorted(unknown))
+                                     + ". Available in this database: " + ", ".join(sorted(self._formats_cache)))
+            extra, extra_params, needs_data = compile_filters(filters)
+            # Validate identity even when no JSON filters are requested.
+            if color_identity is not None:
+                color_clause("c.ci_mask", color_identity, filters.color_identity_match)
+        except (ValidationError, ValueError) as err:
+            raise SearchError(str(err)) from err
         if game_changers not in ("include", "exclude", "only"):
             raise SearchError("game_changers must be 'include', 'exclude' or 'only'")
-
         where = ["c.is_card = 1"]
         params: List = []
         notes: List[str] = []
 
-        if commander_legal:
+        if commander_legal and "commander" not in filters.legalities:
             where.append("c.commander_legal = 1")
 
         for t in self._require_tags(tags_all):
@@ -338,9 +349,9 @@ class CardSearch:
             params.append(f"%{ty.strip().lower()}%")
 
         if color_identity is not None:
-            allowed = _parse_identity(color_identity)
-            where.append("(c.ci_mask & ?) = 0")
-            params.append(31 & ~allowed)
+            clause, values = color_clause("c.ci_mask", color_identity, filters.color_identity_match)
+            where.append(clause)
+            params.extend(values)
 
         if mv_min is not None:
             where.append("c.mana_value >= ?"); params.append(mv_min)
@@ -368,6 +379,47 @@ class CardSearch:
             if unknown:
                 notes.append("Could not resolve exclude names: " + ", ".join(unknown[:10]))
 
+        where.extend(extra)
+        params.extend(extra_params)
+        if filters.price_min is not None and price_max is None:
+            notes.append("Cards without a known EUR price are excluded when price_min is set.")
+        source = "card_index c" + (" JOIN cards d ON d.name_normalized = c.name_normalized" if needs_data else "")
+        return where, params, notes, source
+
+    def search_cards(
+        self,
+        tags_all: Sequence[str] = (),
+        tags_any: Sequence[str] = (),
+        tags_none: Sequence[str] = (),
+        text: Optional[str] = None,
+        types: Sequence[str] = (),
+        types_none: Sequence[str] = (),
+        color_identity: Optional[str] = None,
+        mv_min: Optional[float] = None,
+        mv_max: Optional[float] = None,
+        price_max: Optional[float] = None,
+        rarity: Sequence[str] = (),
+        exclude: Sequence[str] = (),
+        commander_legal: bool = True,
+        game_changers: str = "include",
+        sort: str = "popular",
+        min_edhrec_rank: Optional[int] = None,
+        max_edhrec_rank: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+        filters: Optional[CardFilters] = None,
+        sort_reverse: bool = False,
+    ) -> Dict:
+        if sort not in SORTS:
+            raise SearchError(f"sort must be one of {', '.join(SORTS)}")
+        where, params, notes, source = self._card_predicates(
+            tags_all=tags_all, tags_any=tags_any, tags_none=tags_none, text=text,
+            types=types, types_none=types_none, color_identity=color_identity,
+            mv_min=mv_min, mv_max=mv_max, price_max=price_max, rarity=rarity,
+            exclude=exclude, commander_legal=commander_legal, game_changers=game_changers, filters=filters,
+        )
+        _validate_bounds("EDHREC rank", min_edhrec_rank, max_edhrec_rank, minimum=1)
+
         if sort == "deep_cut" and min_edhrec_rank is None:
             min_edhrec_rank = DEFAULT_DEEP_CUT_RANK
             notes.append(f"deep_cut hides the {DEFAULT_DEEP_CUT_RANK} most-played EDHREC cards "
@@ -384,19 +436,30 @@ class CardSearch:
             "deep_cut": "c.edhrec_rank IS NULL, c.edhrec_rank, c.name",
             "least_popular": "c.edhrec_rank IS NULL, c.edhrec_rank DESC, c.name",
             "price": "c.price_eur IS NULL, c.price_eur, c.edhrec_rank IS NULL, c.edhrec_rank",
-            "mana_value": "c.mana_value, c.edhrec_rank IS NULL, c.edhrec_rank",
+            "mana_value": "c.mana_value IS NULL, c.mana_value, c.edhrec_rank IS NULL, c.edhrec_rank",
             "name": "c.name",
             "random": "random()",
         }[sort]
 
+        if sort_reverse:
+            if sort not in ("price", "mana_value", "name"):
+                raise SearchError("sort_reverse is supported for price, mana_value and name. Use least_popular to reverse popularity.")
+            order = {
+                "price": "c.price_eur IS NULL, c.price_eur DESC, c.name",
+                "mana_value": "c.mana_value IS NULL, c.mana_value DESC, c.name",
+                "name": "c.name DESC",
+            }[sort]
+        # A name tie-break keeps pages stable when ranks, prices or mana values tie.
+        if sort in ("price", "mana_value") and not sort_reverse:
+            order += ", c.name"
         clause = " AND ".join(where)
-        total = self.conn.execute(f"SELECT COUNT(*) FROM card_index c WHERE {clause}", params).fetchone()[0]
+        total = self.conn.execute(f"SELECT COUNT(*) FROM {source} WHERE {clause}", params).fetchone()[0]
         limit = max(1, min(int(limit), MAX_LIMIT))
         rows = self.conn.execute(
-            f"SELECT c.* FROM card_index c WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?",
+            f"SELECT c.* FROM {source} WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?",
             params + [limit, max(0, int(offset))],
         ).fetchall()
-        return {"total": total, "offset": offset, "rows": [dict(r) for r in rows], "notes": notes}
+        return {"total": total, "offset": max(0, int(offset)), "rows": [dict(r) for r in rows], "notes": notes}
 
     # -- full card details --------------------------------------------------
 
@@ -528,16 +591,24 @@ class CardSearch:
         limit: int = 40,
         offset: int = 0,
         refresh: bool = False,
+        filters: Optional[CardFilters] = None,
+        color_identity: Optional[str] = None,
+        commander_legal: bool = True,
+        sort_reverse: bool = False,
     ) -> Dict:
         """EDHREC's recommended pool for a commander, joined with local card data and filtered."""
         from edhrec import EdhrecError
 
-        self.require_index(need_tags=bool(tags_all or tags_any or tags_none))
         sorts = ("inclusion", "synergy", "lift", "trend", "price", "mana_value", "name")
         if sort not in sorts:
             raise SearchError(f"sort must be one of {', '.join(sorts)}")
 
-        notes = []
+        where, params, notes, source = self._card_predicates(
+            tags_all=tags_all, tags_any=tags_any, tags_none=tags_none,
+            types=types, types_none=types_none, color_identity=color_identity,
+            mv_min=mv_min, mv_max=mv_max, price_max=price_max, exclude=exclude,
+            commander_legal=commander_legal, game_changers=game_changers, filters=filters,
+        )
         commanders = []
         for raw in [commander, partner]:
             if raw:
@@ -556,35 +627,25 @@ class CardSearch:
         # Join with the local index.
         names = [c["name"] for c in page["cards"]]
         resolved = self.resolve_names(names)
-        keys = [k for k in resolved.values() if k]
+        keys = sorted({k for k in resolved.values() if k})
         local = {}
-        if keys:
-            ph = ",".join("?" * len(keys))
-            for r in self.conn.execute(f"SELECT * FROM card_index WHERE name_normalized IN ({ph})", keys):
+        # Batch candidate IDs to stay below older SQLite parameter limits.
+        for start in range(0, len(keys), 400):
+            batch = keys[start:start + 400]
+            ph = ",".join("?" * len(batch))
+            clause = " AND ".join(where + [f"c.name_normalized IN ({ph})"])
+            for r in self.conn.execute(f"SELECT c.* FROM {source} WHERE {clause}", params + batch):
                 local[r["name_normalized"]] = dict(r)
         unmatched = [n for n, k in resolved.items() if not k]
 
-        def tag_oracles(tag_names):
-            out = []
-            for t in self._require_tags(tag_names):
-                out.append({r[0] for r in self.conn.execute(
-                    "SELECT oracle_id FROM tag_cards WHERE tag_key = ?", (t["key"],))})
-            return out
-
-        all_sets = tag_oracles(tags_all)
-        any_set = set().union(*tag_oracles(tags_any)) if tags_any else None
-        none_set = set().union(*tag_oracles(tags_none)) if tags_none else set()
-        excluded = {k for k in self.resolve_names(exclude).values() if k} if exclude else set()
         commander_keys = {k for k in self.resolve_names(commanders).values() if k}
         sec_filter = [x.lower() for x in sections or []]
-        types_l = [t.lower() for t in types or []]
-        types_none_l = [t.lower() for t in types_none or []]
 
         rows = []
         for card in page["cards"]:
             key = resolved.get(card["name"])
             info = local.get(key) if key else None
-            if info is None or key in excluded or key in commander_keys:
+            if info is None or key in commander_keys:
                 continue
             tl = (info["type_line"] or "").lower()
             if "basic" in tl and "land" in tl:
@@ -594,26 +655,11 @@ class CardSearch:
             labels = [card["section"]] + card["labels"]
             if sec_filter and not any(f in l.lower() for f in sec_filter for l in labels):
                 continue
-            if any(t not in tl for t in types_l) or any(t in tl for t in types_none_l):
-                continue
-            oid = info["oracle_id"]
-            if any(oid not in s_ for s_ in all_sets) or (any_set is not None and oid not in any_set) \
-                    or oid in none_set:
-                continue
-            if price_max is not None and (info["price_eur"] is None or info["price_eur"] > price_max):
-                continue
-            mv = info["mana_value"] or 0
-            if (mv_min is not None and mv < mv_min) or (mv_max is not None and mv > mv_max):
-                continue
             incl = (card["inclusion"] or 0) * 100
             if min_inclusion is not None and incl < min_inclusion:
                 continue
             syn = (card["synergy"] or 0) * 100
             if min_synergy is not None and syn < min_synergy:
-                continue
-            if game_changers == "exclude" and info["game_changer"]:
-                continue
-            if game_changers == "only" and not info["game_changer"]:
                 continue
             rows.append({**info, "section": card["section"], "labels": card["labels"],
                          "inclusion": incl, "synergy": syn, "lift": card["lift"],
@@ -628,13 +674,17 @@ class CardSearch:
             "mana_value": lambda r: (r["mana_value"] or 0, -r["inclusion"]),
             "name": lambda r: r["name"],
         }[sort]
-        rows.sort(key=keyf)
-        if price_max is not None:
-            notes.append("Cards without a known EUR price are excluded when price_max is set.")
+        # Keep unknown prices/mana values last in either direction.
+        rows.sort(key=lambda r: r["name"])
+        rows.sort(key=keyf, reverse=sort_reverse)
+        if sort in ("price", "mana_value"):
+            column = "price_eur" if sort == "price" else "mana_value"
+            rows.sort(key=lambda r: r[column] is None)
         if unmatched:
             notes.append(f"{len(unmatched)} EDHREC card(s) not in the local database "
                          f"(update the local DB): " + ", ".join(unmatched[:8]))
         limit = max(1, min(int(limit), MAX_LIMIT))
+        offset = max(0, int(offset))
         return {"page": page, "commanders": commanders, "total": len(rows), "offset": offset,
                 "rows": rows[offset:offset + limit], "notes": notes}
 
@@ -788,15 +838,12 @@ def _stem(word: str) -> str:
     return w
 
 
-def _parse_identity(value: str) -> int:
-    v = (value or "").strip().upper()
-    if v in ("", "C", "COLORLESS", "COLOURLESS"):
-        return 0
-    letters = set(v.replace(",", "").replace(" ", "").replace("{", "").replace("}", ""))
-    bad = letters - set("WUBRG")
-    if bad:
-        raise SearchError(f"color_identity must use the letters W, U, B, R, G (or 'C'); got '{value}'")
-    return si.ci_mask(letters)
+def _validate_bounds(label, low, high, minimum=0):
+    for value in (low, high):
+        if value is not None and (not math.isfinite(value) or value < minimum):
+            raise SearchError(f"{label} bounds must be finite and at least {minimum}.")
+    if low is not None and high is not None and low > high:
+        raise SearchError(f"Minimum {label} must be less than or equal to maximum {label}.")
 
 
 def _fts_query(text: str) -> str:

@@ -141,6 +141,13 @@ class StdioTests(unittest.TestCase):
                         self.assertTrue(tool['annotations']['readOnlyHint'])
                         self.assertEqual(tool['annotations']['openWorldHint'], name.startswith('edhrec_'))
                     self.assertEqual(tools['find_tags']['inputSchema']['required'], ['query'])
+                    # Nested refinements must be discoverable to both clients,
+                    # without adding another search tool or changing old calls.
+                    for name in ('search_cards', 'edhrec_recommendations'):
+                        schema = tools[name]['inputSchema']
+                        self.assertIn('filters', schema['properties'])
+                        self.assertIn('legalities', json.dumps(schema))
+                        self.assertIn('stats', json.dumps(schema))
                     def call(name, arguments):
                         return request('tools/call', {'name': name, 'arguments': arguments})
                     status = call('database_status', {})
@@ -148,6 +155,18 @@ class StdioTests(unittest.TestCase):
                     self.assertIn('Indexed cards: 1', status['content'][0]['text'])
                     result = call('search_cards', {'text': 'Sol Ring', 'limit': 1})
                     self.assertIn('Sol Ring', result['content'][0]['text'])
+                    empty_page = call('search_cards', {'text': 'Sol Ring', 'offset': 1})
+                    self.assertIn('1 cards match, but offset=1', empty_page['content'][0]['text'])
+                    result = call('search_cards', {
+                        'color_identity': 'C', 'price_max': 2,
+                        'filters': {'color_identity_match': 'exact', 'price_min': 1,
+                                    'legalities': {'commander': 'legal'}, 'name_contains': 'Ring'},
+                    })
+                    self.assertIn('Sol Ring', result['content'][0]['text'])
+                    self.assertTrue(call('search_cards', {'filters': {'price_mni': 1}})['isError'])
+                    self.assertTrue(call('search_cards', {'filters': {'stats': {'power': {'min': 3, 'max': 2}}}})['isError'])
+                    bad_range = call('search_cards', {'mv_min': 4, 'mv_max': 1})
+                    self.assertIn('Minimum mana value', bad_range['content'][0]['text'])
                     self.assertTrue(call('find_tags', {'query': 'ramp', 'limit': 0})['isError'])
                     self.assertIn('Sol Ring', call('search_cards', {'text': 'Sol Ring'})['content'][0]['text'])
                     resources = request('resources/list')['resources']

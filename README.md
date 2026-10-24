@@ -94,6 +94,100 @@ you name, the same JSON the EDHREC website loads, and caches it for 7 days in
 `edhrec_cache.db` next to the card database. Repeat requests are offline, and if
 EDHREC is unreachable an older cached copy is used. The server performs these requests; the client does not need a browser tool.
 
+### Composing detailed card queries
+
+Use the existing `search_cards` tool for local discovery and
+`edhrec_recommendations` for a commander's recommendation pool. Both accept the
+same optional **`filters` object** for additional refinements. There are no
+separate tools for each filter combination. Existing arguments such as
+`tags_all`/`tags_any`/`tags_none`, `types`/`types_none`, `color_identity`,
+`mv_min`/`mv_max`, `price_max`, and `exclude` keep their meanings and defaults.
+`rarity` and EDHREC-rank bounds remain available on `search_cards`.
+
+All supplied criteria are combined with **AND**; fields named `any` and
+`layouts` accept alternatives within that field. Filters run before sorting,
+counting, and pagination. Omit a criterion to leave that property unrestricted.
+
+| Inside `filters` | Meaning |
+| --- | --- |
+| `color_identity_match` | Refines the existing `color_identity`: `subset` (default, within a commander's identity), `exact`, `contains` (every requested color), or `overlap` (at least one requested color). |
+| `colors`, `colors_match` | Actual card colors, distinct from identity. WUBRG letters or `C`; same matching modes, default `exact`. Uses the card's top-level colors, or the union of its faces if those are absent. |
+| `legalities` | Format-to-status map, e.g. `{"modern":"legal","vintage":"restricted"}`. All entries must match. Statuses: `legal`, `not_legal`, `restricted`, `banned`. An absent format is unknown and does not match `not_legal`. |
+| `price_min` | Inclusive EUR minimum, combined with existing `price_max`. |
+| `price_known` | `true`: priced cards only; `false`: unpriced only; omitted: either. Unpriced cards never pass price bounds. |
+| `name_contains`, `oracle_contains` | Literal, case-insensitive substring in name only or rules text only. Rules text includes all faces; `%` and `_` are literal characters. Existing `text` remains full-text search across name/type/rules. |
+| `types_any` | At least one type-line substring, combined with existing `types` and `types_none`. |
+| `keywords_all`, `keywords_any`, `keywords_none` | Exact Scryfall keyword names, case-insensitive, e.g. `Flying`, `Ward`. These are distinct from functional Tagger slugs. |
+| `layouts` | Any listed Scryfall layout, e.g. `normal`, `transform`, `modal_dfc`, `adventure`. |
+| `stats` | Map of `power`, `toughness`, `loyalty`, or `defense` to inclusive `min`/`max` ranges. All ranges must match one face. Missing or variable stats (`*`, `1+*`, `X`) never pass numeric bounds. |
+
+Both tools default to `commander_legal=true`. An explicit
+`filters.legalities.commander` takes precedence, so asking for banned Commander
+cards works without also changing the boolean. For a different format without
+the Commander restriction, set `commander_legal=false`. Unknown formats produce
+an error listing the formats recorded in your local database. `overlap` requires
+at least one color; use `exact` with `C` for colorless cards.
+
+Both tools accept `sort_reverse=true` to reverse the default sort direction.
+On `search_cards`, this applies to `price`, `mana_value`, and `name`; use the
+existing `least_popular` sort to reverse popularity. EDHREC supports reversing
+any of its sorts (e.g. lowest inclusion first). Unknown prices and mana values
+stay last. Deterministic sorts use card names to break ties for stable pages;
+`random` remains a fresh sample on each call.
+
+Example `search_cards` arguments for affordable ramp inside a Golgari identity:
+
+```json
+{
+  "tags_all": ["ramp"],
+  "color_identity": "BG",
+  "mv_max": 2,
+  "price_max": 3,
+  "filters": {"price_min": 0.25},
+  "sort": "price"
+}
+```
+
+Example for blue Modern-legal flyers with at least four power:
+
+```json
+{
+  "commander_legal": false,
+  "types": ["creature"],
+  "filters": {
+    "colors": "U",
+    "colors_match": "contains",
+    "legalities": {"modern": "legal"},
+    "keywords_all": ["Flying"],
+    "stats": {"power": {"min": 4}}
+  }
+}
+```
+
+Example `edhrec_recommendations` arguments combining the existing pool selection
+with the shared card filters:
+
+```json
+{
+  "commander": "Korvold, Fae-Cursed King",
+  "theme": "sacrifice",
+  "price_max": 5,
+  "mv_max": 3,
+  "filters": {"types_any": ["creature", "artifact"], "price_min": 0.25},
+  "sort": "synergy"
+}
+```
+
+These refinements read existing cached JSON; **no database migration, rebuild,
+or new download is required**. Restart the MCP client/server to discover the
+updated schemas. Install updated `requirements.txt` when running from source.
+The local cache contains one stored Scryfall record per card name, plus the
+cheapest regular paper EUR price across printings. It is not an index of every
+printing. Legality and prices reflect the last local database update. EDHREC
+still fetches requested pages and caches them for seven days; these changes do
+not turn it into an offline copy of all of EDHREC. Raw Scryfall query syntax,
+arbitrary SQL, printing/set searches, and additional currencies are not parsed.
+
 ### Setup
 
 **Packaged app:** each build also contains `MtgCardsMCP` (`MtgCardsMCP.exe` on
@@ -230,6 +324,9 @@ python -m unittest discover -s tests -v
 Python 3.10 also needs `pip install tomli` for these tests. They exercise JSON/TOML
 configuration, stdio initialization with Codex and Claude client identities,
 tool discovery, search, validation, resources, and missing-database recovery.
-They use a temporary fixture database and do not download Scryfall or EDHREC data.
+They also exercise composed filters, all color/legality modes, unknown prices,
+multi-face stats, filtered pagination, and the shared EDHREC filtering path.
+They use temporary read-only fixture databases and mocked EDHREC pools; no
+Scryfall or EDHREC data is downloaded.
 Set `MCP_SERVER_BINARY` to a built server's absolute path to test the packaged
 executable instead. CI checks both supported SDK major versions and all three OSes.

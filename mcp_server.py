@@ -38,6 +38,7 @@ except ImportError:  # very old SDKs
 
 import search_index as si
 from card_search import CardSearch, SearchError, DEFAULT_DEEP_CUT_RANK, MAX_LIMIT
+from card_filters import CardFilters
 
 INSTRUCTIONS = f"""\
 Magic: The Gathering card search over the user's local Scryfall database
@@ -75,6 +76,18 @@ rules_search to find which rules cover something, and rules_glossary for
 terms. Cite rule numbers. The full text is also the resource
 rules://comprehensive-rules. You cannot download rules; if they are missing or
 outdated, tell the user to click 'Update Rules' in MTG Deck Formatter.
+
+Queries: combine the existing top-level tag, text, type, color_identity, mv_min,
+mv_max and price_max arguments. Optional filters adds exact/contains/overlap
+identity matching, actual card colors, per-format legalities, price_min and
+price_known, field-specific literal text, types_any, exact keywords, layouts,
+and numeric face stats. All filters are ANDed. Use filters.legalities for
+legal/banned/restricted/not_legal in any format recorded in the cache; an explicit
+Commander status overrides commander_legal. For non-Commander searches, pass
+commander_legal=false. Unknown prices fail price bounds; missing/variable stats
+fail numeric ranges. Color matching uses WUBRG letters or C. No Scryfall query
+language is parsed; use the named arguments. The same filters object works in
+edhrec_recommendations.
 
 Prices are the cheapest regular paper EUR price across printings, from the
 last database update. EDHREC pages are cached locally for 7 days.
@@ -228,7 +241,7 @@ def search_cards(
     types_none: Annotated[Optional[List[str]], Field(description="Type-line words to exclude, e.g. ['land'].")] = None,
     color_identity: Annotated[Optional[str], Field(description=(
         "Commander colour identity as WUBRG letters, e.g. 'BG' or 'WUR'; 'C' for colourless. "
-        "Only cards inside this identity are returned."))] = None,
+        "By default only cards inside this identity are returned; filters.color_identity_match changes the match mode."))] = None,
     mv_min: Annotated[Optional[float], Field(description="Minimum mana value.")] = None,
     mv_max: Annotated[Optional[float], Field(description="Maximum mana value.")] = None,
     price_max: Annotated[Optional[float], Field(description="Maximum price in EUR (cheapest paper printing).")] = None,
@@ -246,8 +259,13 @@ def search_cards(
     max_edhrec_rank: Annotated[Optional[int], Field(description="Only cards ranked this well or better on EDHREC.")] = None,
     limit: Annotated[int, Field(ge=1, le=MAX_LIMIT)] = 25,
     offset: Annotated[int, Field(ge=0)] = 0,
+    filters: Annotated[Optional[CardFilters], Field(description=(
+        "Additional refinements; combine with the existing top-level filters. All supplied criteria are ANDed."))] = None,
+    sort_reverse: Annotated[bool, Field(description="Reverse the default order for price, mana_value or name; unknown values stay last.")] = False,
 ) -> str:
-    """Search the local card database with tag, text, colour identity, curve, budget and popularity filters.
+    """Search local cards by tags, text, identity, mana value, budget and popularity.
+
+    Use filters for colors, format legality, keywords, layouts and numeric stats.
 
     Returns a compact table (rules text truncated). Use get_cards for full details."""
     res = engine().search_cards(
@@ -256,15 +274,18 @@ def search_cards(
         mv_min=mv_min, mv_max=mv_max, price_max=price_max, rarity=rarity or [], exclude=exclude or [],
         commander_legal=commander_legal, game_changers=game_changers, sort=sort,
         min_edhrec_rank=min_edhrec_rank, max_edhrec_rank=max_edhrec_rank, limit=limit, offset=offset,
+        filters=filters, sort_reverse=sort_reverse,
     )
     rows = res["rows"]
     if not rows:
+        if res["total"]:
+            return f"{res['total']} cards match, but offset={offset} is beyond the last result. Use offset=0 to start again."
         msg = "No cards matched."
         if res["notes"]:
             msg += " " + " ".join(res["notes"])
         return msg + " Loosen filters, try broader/parent tags, or a different sort."
 
-    lines = [f"{res['total']} cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}).", "",
+    lines = [f"{res['total']} cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).", "",
              "| Card | Mana | Type | CI | EDHREC | Price | Rules text |",
              "| --- | --- | --- | --- | ---: | ---: | --- |"]
     for r in rows:
@@ -390,6 +411,10 @@ def edhrec_recommendations(
     limit: Annotated[int, Field(ge=1, le=MAX_LIMIT)] = 40,
     offset: Annotated[int, Field(ge=0)] = 0,
     refresh: Annotated[bool, Field(description="Re-download from EDHREC instead of using the 7-day local cache.")] = False,
+    filters: Annotated[Optional[CardFilters], Field(description="Same additional card refinements as search_cards; applied before ranking and pagination.")] = None,
+    color_identity: Annotated[Optional[str], Field(description="Optional WUBRG identity or C; subset by default, refined by filters.color_identity_match.")] = None,
+    commander_legal: Annotated[bool, Field(description="Only Commander-legal cards unless filters.legalities supplies an explicit Commander status.")] = True,
+    sort_reverse: Annotated[bool, Field(description="Reverse this sort's default order (e.g. price: highest first; inclusion: lowest first).")] = False,
 ) -> str:
     """EDHREC's recommended cards for a commander (optionally a theme, power bracket or budget pool),
     enriched with local mana cost, type, price and rules text, and filterable by Scryfall tags,
@@ -400,6 +425,7 @@ def edhrec_recommendations(
         tags_none=tags_none or [], price_max=price_max, mv_min=mv_min, mv_max=mv_max, exclude=exclude or [],
         min_inclusion=min_inclusion, min_synergy=min_synergy, include_lands=include_lands,
         game_changers=game_changers, sort=sort, limit=limit, offset=offset, refresh=refresh,
+        filters=filters, color_identity=color_identity, commander_legal=commander_legal, sort_reverse=sort_reverse,
     )
     page, rows = res["page"], res["rows"]
     out = [f"**{page['header']}** · {page['num_decks'] or '?'} decks on EDHREC · data from {_fetched(page['fetched_at'])}"]
@@ -416,9 +442,12 @@ def edhrec_recommendations(
                        ", ".join(f"{k}:{v}" for k, v in sorted(page["mana_curve"].items(), key=lambda x: float(x[0]))))
     out.append("")
     if not rows:
-        out.append(f"No recommended cards match these filters (pool after filters: {res['total']}).")
+        if res["total"]:
+            out.append(f"{res['total']} recommended cards match, but offset={offset} is beyond the last result. Use offset=0 to start again.")
+        else:
+            out.append("No recommended cards match these filters.")
     else:
-        out.append(f"{res['total']} recommended cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}).")
+        out.append(f"{res['total']} recommended cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).")
         out += ["", "| Card | EDHREC list | Incl. | Synergy | Lift | Mana | Type | Price | Rules text |",
                 "| --- | --- | ---: | ---: | ---: | --- | --- | ---: | --- |"]
         for r in rows:

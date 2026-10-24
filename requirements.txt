@@ -1,4 +1,6 @@
 requests
 certifi
+# Typed card-query validation (also used by the MCP tool schemas)
+pydantic>=2,<3
 # Optional: only needed for the Codex / Claude MCP integration (mcp_server.py)
 mcp

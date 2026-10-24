@@ -205,6 +205,57 @@ class FilterTests(unittest.TestCase):
         self.assertEqual(rec["total"], 1)
         self.assertEqual(self.engine.edhrec_recommendations("Test Commander", offset=1, **query)["rows"], [])
 
+    def test_edhrec_all_pages_ignores_pagination_and_passes_bracket(self):
+        client = self.edhrec_client()
+        paged = self.engine.edhrec_recommendations("Test Commander", limit=2)
+        all_rows = self.engine.edhrec_recommendations(
+            "Test Commander", bracket="upgraded", all_pages=True, limit=1, offset=10)
+        self.assertGreater(paged["total"], 2)
+        self.assertEqual(len(paged["rows"]), 2)
+        self.assertEqual(all_rows["total"], paged["total"])
+        self.assertEqual(len(all_rows["rows"]), paged["total"])
+        self.assertEqual(all_rows["offset"], 0)
+        self.assertEqual([r["name"] for r in all_rows["rows"][:2]],
+                         [r["name"] for r in paged["rows"]])
+        client.commander_page.assert_called_with(
+            ["Test Commander"], theme=None, bracket="upgraded",
+            budget=None, refresh=False)
+
+    def test_mcp_edhrec_defaults_to_full_text_and_all_pages(self):
+        from unittest.mock import patch
+        import mcp_server
+
+        long_rules = "Pay {2}: " + ("Draw a card, then discard a card. " * 12)
+        sample = {
+            "name": "Example Card", "game_changer": False, "section": "Creatures",
+            "inclusion": 50, "synergy": 5, "lift": 2.0,
+            "mana_cost": "{2}{U}", "type_line": "Creature — Wizard",
+            "price_eur": 1.0, "oracle_text": long_rules,
+        }
+        page = {
+            "header": "Test Commander", "num_decks": 100, "fetched_at": None,
+            "themes": [{"slug": "tokens", "decks": 20}],
+            "bracket_counts": {"upgraded": 42}, "similar": [],
+            "type_counts": {}, "mana_curve": {},
+        }
+        with patch.object(mcp_server, "engine") as engine:
+            engine.return_value.edhrec_recommendations.return_value = {
+                "page": page, "rows": [sample], "total": 1, "offset": 0, "notes": [],
+            }
+            result = mcp_server.edhrec_recommendations("Test Commander", bracket="upgraded")
+            self.assertIn(long_rules, result)
+            self.assertNotIn("Brackets:", result)
+            forwarded = engine.return_value.edhrec_recommendations.call_args.kwargs
+            self.assertTrue(forwarded["all_pages"])
+            self.assertEqual(forwarded["bracket"], "upgraded")
+            short = mcp_server.edhrec_recommendations("Test Commander", full_text=False)
+            self.assertNotIn(long_rules, short)
+            self.assertIn("…", short)
+            self.assertIn("Brackets:", short)
+            self.assertIn("`upgraded` (3; 42 decks)", short)
+            mcp_server.edhrec_recommendations("Test Commander", all_pages=False)
+            self.assertFalse(engine.return_value.edhrec_recommendations.call_args.kwargs["all_pages"])
+
     def test_edhrec_rejects_bad_filters_before_network_access(self):
         client = self.edhrec_client()
         with self.assertRaises(SearchError):

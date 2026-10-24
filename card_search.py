@@ -595,6 +595,7 @@ class CardSearch:
         color_identity: Optional[str] = None,
         commander_legal: bool = True,
         sort_reverse: bool = False,
+        all_pages: bool = False,
     ) -> Dict:
         """EDHREC's recommended pool for a commander, joined with local card data and filtered."""
         from edhrec import EdhrecError
@@ -685,8 +686,11 @@ class CardSearch:
                          f"(update the local DB): " + ", ".join(unmatched[:8]))
         limit = max(1, min(int(limit), MAX_LIMIT))
         offset = max(0, int(offset))
-        return {"page": page, "commanders": commanders, "total": len(rows), "offset": offset,
-                "rows": rows[offset:offset + limit], "notes": notes}
+        # MCP callers can request the complete filtered pool in one response.
+        # Keep pagination as the default for non-MCP callers.
+        selected = rows if all_pages else rows[offset:offset + limit]
+        return {"page": page, "commanders": commanders, "total": len(rows),
+                "offset": 0 if all_pages else offset, "rows": selected, "notes": notes}
 
     def edhrec_average_deck(self, commander: str, partner: Optional[str] = None,
                             theme: Optional[str] = None, bracket: Optional[str] = None,

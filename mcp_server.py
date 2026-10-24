@@ -51,7 +51,9 @@ recommended cards for it (inclusion % = share of that commander's decks
 running the card, synergy = how much more than in other decks of those
 colours, lift = how unusually strongly it pairs with this commander). It
 accepts the same tag / budget / curve / type filters as search_cards, plus an
-EDHREC theme, power bracket or budget tier. Pick from this pool according to
+EDHREC theme, power bracket or budget tier. By default it returns the complete
+filtered pool with untruncated Oracle text (all_pages=true, full_text=true).
+Pick from this pool according to
 the task (theme, budget, bracket) rather than copying the top of the list:
 sort="lift" or "synergy" surfaces commander-specific picks; sort="inclusion"
 is the generic consensus. edhrec_average_deck gives a baseline 99. Combine
@@ -386,7 +388,9 @@ def edhrec_recommendations(
         "An EDHREC theme slug for this commander, e.g. 'sacrifice', 'treasure', 'tokens'. "
         "The first call (no theme) lists the available themes."))] = None,
     bracket: Annotated[Optional[Literal["exhibition", "core", "upgraded", "optimized", "cedh"]], Field(
-        description="Restrict to decks of one Commander power bracket (1-5). Cannot be combined with theme.")] = None,
+        description=("Restrict to a Commander bracket: exhibition (1), core (2), upgraded (3), "
+                     "optimized (4), or cedh (5). As with themes, the first call lists available brackets. "
+                     "Cannot be combined with theme."))] = None,
     budget: Annotated[Optional[Literal["budget", "expensive"]], Field(
         description="EDHREC's budget or expensive deck pool.")] = None,
     sections: Annotated[Optional[List[str]], Field(description=(
@@ -408,8 +412,10 @@ def edhrec_recommendations(
         description=("inclusion: most-played with this commander. synergy: played much more with this commander "
                      "than in other decks of its colours. lift: unusually strong commander-specific pairings "
                      "(good for non-generic picks). trend: rising recently. price: cheapest first."))] = "inclusion",
-    limit: Annotated[int, Field(ge=1, le=MAX_LIMIT)] = 40,
-    offset: Annotated[int, Field(ge=0)] = 0,
+    limit: Annotated[int, Field(ge=1, le=MAX_LIMIT, description="Page size when all_pages=false.")] = 40,
+    offset: Annotated[int, Field(ge=0, description="Starting position when all_pages=false.")] = 0,
+    full_text: Annotated[bool, Field(description="Return complete, untruncated Oracle rules text (default true).")] = True,
+    all_pages: Annotated[bool, Field(description="Return all matching recommendations, ignoring limit and offset (default true).")] = True,
     refresh: Annotated[bool, Field(description="Re-download from EDHREC instead of using the 7-day local cache.")] = False,
     filters: Annotated[Optional[CardFilters], Field(description="Same additional card refinements as search_cards; applied before ranking and pagination.")] = None,
     color_identity: Annotated[Optional[str], Field(description="Optional WUBRG identity or C; subset by default, refined by filters.color_identity_match.")] = None,
@@ -418,20 +424,36 @@ def edhrec_recommendations(
 ) -> str:
     """EDHREC's recommended cards for a commander (optionally a theme, power bracket or budget pool),
     enriched with local mana cost, type, price and rules text, and filterable by Scryfall tags,
-    budget and curve. Also reports the commander's themes, similar commanders and average deck shape."""
+    budget and curve. By default returns every matching card with complete rules text.
+    Also reports available themes, power brackets, similar commanders and average deck shape."""
     res = engine().edhrec_recommendations(
         commander, partner=partner, theme=theme, bracket=bracket, budget=budget, sections=sections or [],
         types=types or [], types_none=types_none or [], tags_all=tags_all or [], tags_any=tags_any or [],
         tags_none=tags_none or [], price_max=price_max, mv_min=mv_min, mv_max=mv_max, exclude=exclude or [],
         min_inclusion=min_inclusion, min_synergy=min_synergy, include_lands=include_lands,
         game_changers=game_changers, sort=sort, limit=limit, offset=offset, refresh=refresh,
-        filters=filters, color_identity=color_identity, commander_legal=commander_legal, sort_reverse=sort_reverse,
+        filters=filters, color_identity=color_identity, commander_legal=commander_legal,
+        sort_reverse=sort_reverse, all_pages=all_pages,
     )
     page, rows = res["page"], res["rows"]
+    offset = res["offset"]
     out = [f"**{page['header']}** · {page['num_decks'] or '?'} decks on EDHREC · data from {_fetched(page['fetched_at'])}"]
     if offset == 0:
         if page["themes"] and not theme:
             out.append("Themes: " + ", ".join(f"`{t['slug']}` ({t['decks']})" for t in page["themes"][:20]))
+        if not theme and not bracket:
+            counts = page.get("bracket_counts") or {}
+            options = [("exhibition", 1), ("core", 2), ("upgraded", 3),
+                       ("optimized", 4), ("cedh", 5)]
+            listed = []
+            for slug, number in options:
+                count = (counts.get(slug, counts.get(str(number)))
+                         if isinstance(counts, dict) else None)
+                if isinstance(count, dict):
+                    count = count.get("count")
+                listed.append(f"`{slug}` ({number}" +
+                              (f"; {count} decks" if isinstance(count, int) else "") + ")")
+            out.append("Brackets: " + ", ".join(listed))
         if page["similar"]:
             out.append("Similar commanders: " + ", ".join(page["similar"][:6]))
         tc = page["type_counts"]
@@ -455,7 +477,8 @@ def edhrec_recommendations(
             out.append("| " + " | ".join([
                 _cell(name), _cell(r["section"]), _pct(r["inclusion"]), _signed_pct(r["synergy"]),
                 f"{r['lift']:.1f}" if r["lift"] else "—", _cell(r["mana_cost"]) or "—",
-                _cell(r["type_line"]), _price(r["price_eur"]), _cell(r["oracle_text"], 150),
+                _cell(r["type_line"]), _price(r["price_eur"]),
+                _cell(r["oracle_text"]) if full_text else _cell(r["oracle_text"], 150),
             ]) + " |")
         if res["total"] > offset + len(rows):
             out.append(f"\nMore: offset={offset + len(rows)}.")

@@ -74,6 +74,12 @@ What each client gets:
     (consensus), `synergy` / `lift` (commander-specific, less generic picks),
     `trend` or `price`. It also reports the commander's themes, similar
     commanders, average type split and mana curve.
+    By default, `all_pages=true` returns every matching recommendation (no pagination)
+    and `full_text=true` includes complete, untruncated Oracle rules text.
+    Set either flag to `false` to restore paginated results or shortened text.
+    The response lists available theme and bracket filters; use `bracket="upgraded"`
+    (or `exhibition`, `core`, `optimized`, `cedh`) similarly to `theme="tokens"`.
+    EDHREC does not support combining a theme with a bracket.
 -   **`edhrec_average_deck`**: EDHREC's average 99 for a commander, with a local
     price total, as a baseline to improve on.
 

@@ -60,6 +60,10 @@ CORE_ROLES = [
 ]
 
 
+BASIC_LANDS = {"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"}
+CARD_TYPES = ("Creature", "Instant", "Sorcery", "Artifact", "Enchantment", "Planeswalker", "Battle", "Land")
+
+
 class SearchError(ValueError):
     """A problem with the query that the caller (or model) can fix."""
 
@@ -69,8 +73,13 @@ class SearchError(ValueError):
 # ---------------------------------------------------------------------------
 
 class CardSearch:
-    def __init__(self, conn: Optional[sqlite3.Connection] = None):
+    def __init__(self, conn: Optional[sqlite3.Connection] = None,
+                 collections_file: Optional[str] = None):
         self.conn = conn or si.connect(read_only=True)
+        self._collections_file = collections_file
+        self._collection_store = None
+        # Loaded collections: name -> {"token", "cards": {key: qty}, "tag_counts"}.
+        self._scopes: Dict[str, Dict] = {}
         self._tags_cache: Optional[List[Dict]] = None
         self._names_cache: Optional[Dict[str, str]] = None
         self._edhrec_client = None
@@ -199,7 +208,7 @@ class CardSearch:
                               ". Use find_tags to discover valid tag slugs.")
         return found
 
-    def find_tags(self, query: str, limit: int = 20) -> List[Dict]:
+    def find_tags(self, query: str, limit: int = 20, collection: Optional[str] = None) -> List[Dict]:
         """Rank tags by how well slug, aliases and description match a free-text query."""
         self.require_index(need_tags=True)
         q = re.sub(r"[-_]+", " ", query.strip().lower())
@@ -230,11 +239,17 @@ class CardSearch:
             scored.append((score, t))
 
         scored.sort(key=lambda x: -x[0])
-        return [t for _, t in scored[:max(1, min(limit, MAX_LIMIT))]]
+        found = [t for _, t in scored[:max(1, min(limit, MAX_LIMIT))]]
+        if collection:
+            counts = self._collection_tag_counts(collection)
+            found = [{**t, "owned_count": counts.get(t["key"], 0)} for t in found]
+        return found
 
     def list_tags(self, parent: Optional[str] = None, prefix: Optional[str] = None,
-                  min_cards: int = 0, offset: int = 0, limit: int = 100) -> Dict:
-        """Browse the tag catalogue: roots, children of a tag, or slugs by prefix."""
+                  min_cards: int = 0, offset: int = 0, limit: int = 100,
+                  collection: Optional[str] = None) -> Dict:
+        """Browse the tag catalogue: roots, children of a tag, or slugs by prefix.
+        With a collection, only tags it has cards for, counted and ordered by those cards."""
         self.require_index(need_tags=True)
         header = None
         tags = self._tags()
@@ -248,8 +263,14 @@ class CardSearch:
             tags = [t for t in tags if t["slug"].startswith(pre)]
         else:
             tags = [t for t in tags if not t["parents"]]
-        tags = [t for t in tags if t["total_count"] >= min_cards]
-        tags.sort(key=lambda t: (-t["total_count"], t["slug"]))
+        if collection:
+            counts = self._collection_tag_counts(collection)
+            tags = [{**t, "owned_count": counts.get(t["key"], 0)} for t in tags]
+            tags = [t for t in tags if t["owned_count"] >= max(1, min_cards)]
+            tags.sort(key=lambda t: (-t["owned_count"], t["slug"]))
+        else:
+            tags = [t for t in tags if t["total_count"] >= min_cards]
+            tags.sort(key=lambda t: (-t["total_count"], t["slug"]))
         limit = max(1, min(limit, 500))
         return {"parent": header, "total": len(tags), "offset": offset,
                 "tags": tags[offset:offset + limit]}
@@ -281,7 +302,7 @@ class CardSearch:
         self, *, tags_all=(), tags_any=(), tags_none=(), text=None,
         types=(), types_none=(), color_identity=None, mv_min=None, mv_max=None,
         price_max=None, rarity=(), exclude=(), commander_legal=True,
-        game_changers="include", filters=None,
+        game_changers="include", filters=None, collection=None,
     ):
         """One predicate builder for local search and EDHREC candidate pools."""
         self.require_index(need_tags=bool(tags_all or tags_any or tags_none))
@@ -313,6 +334,11 @@ class CardSearch:
         where = ["c.is_card = 1"]
         params: List = []
         notes: List[str] = []
+
+        if collection:
+            clause, values = self._collection_clause(collection)
+            where.append(clause)
+            params += values
 
         if commander_legal and "commander" not in filters.legalities:
             where.append("c.commander_legal = 1")
@@ -409,6 +435,7 @@ class CardSearch:
         offset: int = 0,
         filters: Optional[CardFilters] = None,
         sort_reverse: bool = False,
+        collection: Optional[str] = None,
     ) -> Dict:
         if sort not in SORTS:
             raise SearchError(f"sort must be one of {', '.join(SORTS)}")
@@ -417,6 +444,7 @@ class CardSearch:
             types=types, types_none=types_none, color_identity=color_identity,
             mv_min=mv_min, mv_max=mv_max, price_max=price_max, rarity=rarity,
             exclude=exclude, commander_legal=commander_legal, game_changers=game_changers, filters=filters,
+            collection=collection,
         )
         _validate_bounds("EDHREC rank", min_edhrec_rank, max_edhrec_rank, minimum=1)
 
@@ -459,7 +487,10 @@ class CardSearch:
             f"SELECT c.* FROM {source} WHERE {clause} ORDER BY {order} LIMIT ? OFFSET ?",
             params + [limit, max(0, int(offset))],
         ).fetchall()
-        return {"total": total, "offset": max(0, int(offset)), "rows": [dict(r) for r in rows], "notes": notes}
+        rows = [dict(r) for r in rows]
+        if collection:
+            self._add_owned(rows, collection)
+        return {"total": total, "offset": max(0, int(offset)), "rows": rows, "notes": notes}
 
     # -- full card details --------------------------------------------------
 
@@ -487,26 +518,31 @@ class CardSearch:
 
     # -- deck analysis ------------------------------------------------------
 
-    def analyze_deck(self, names: Sequence[str], extra_tags: Sequence[str] = (), top: int = 25) -> Dict:
-        """Count role tags in a decklist and list its most common functional tags."""
+    def analyze_deck(self, names: Sequence[str] = (), extra_tags: Sequence[str] = (), top: int = 25,
+                     collection: Optional[str] = None) -> Dict:
+        """Count role tags in a decklist (or a whole collection) and list its most common functional tags."""
         self.require_index(need_tags=True)
-        resolved = self.resolve_names(names)
-        keys = sorted({k for k in resolved.values() if k})
-        unknown = [n for n, k in resolved.items() if not k]
-        if not keys:
+        if collection:
+            # A collection can hold thousands of cards: match through its temp table.
+            members, keys_params = self._collection_clause(collection, column="name_normalized")
+            unknown = []
+            count = len(self._collection(collection)["cards"])
+        else:
+            resolved = self.resolve_names(names)
+            keys = sorted({k for k in resolved.values() if k})
+            unknown = [n for n, k in resolved.items() if not k]
+            members = "name_normalized IN (%s)" % ",".join("?" * len(keys))
+            keys_params, count = keys, len(keys)
+        if not count:
             raise SearchError("None of the given card names were found in the local database.")
 
-        ph = ",".join("?" * len(keys))
-        oracle_ids = [r[0] for r in self.conn.execute(
-            f"SELECT oracle_id FROM card_index WHERE name_normalized IN ({ph}) AND oracle_id IS NOT NULL",
-            keys)]
-        oph = ",".join("?" * len(oracle_ids)) or "NULL"
+        oracle_ids = (f"SELECT oracle_id FROM card_index WHERE {members} AND oracle_id IS NOT NULL")
 
         def cards_with(tag_key):
             return [r[0] for r in self.conn.execute(
                 f"SELECT c.name FROM card_index c JOIN tag_cards tc ON tc.oracle_id = c.oracle_id "
-                f"WHERE tc.tag_key = ? AND c.name_normalized IN ({ph}) ORDER BY c.name",
-                [tag_key] + keys)]
+                f"WHERE tc.tag_key = ? AND c.{members} ORDER BY c.name",
+                [tag_key] + keys_params)]
 
         roles = []
         wanted = [(s, label) for s, label in CORE_ROLES] + [(t, t) for t in extra_tags]
@@ -517,18 +553,18 @@ class CardSearch:
 
         common = self.conn.execute(
             f"SELECT t.slug, COUNT(*) AS n FROM tag_cards tc JOIN tags t ON t.tag_key = tc.tag_key "
-            f"WHERE tc.direct = 1 AND tc.oracle_id IN ({oph}) GROUP BY t.slug "
+            f"WHERE tc.direct = 1 AND tc.oracle_id IN ({oracle_ids}) GROUP BY t.slug "
             f"HAVING n > 1 ORDER BY n DESC, t.slug",
-            oracle_ids,
+            keys_params,
         ).fetchall()
         common = [r for r in common if not NOISE_TAG.search(r[0])][:top]
 
         identity = 0
-        for r in self.conn.execute(f"SELECT ci_mask FROM card_index WHERE name_normalized IN ({ph})", keys):
+        for r in self.conn.execute(f"SELECT ci_mask FROM card_index WHERE {members}", keys_params):
             identity |= r[0] or 0
 
         return {
-            "card_count": len(keys), "unknown": unknown, "roles": roles,
+            "card_count": count, "unknown": unknown, "roles": roles,
             "common_tags": [{"slug": r[0], "count": r[1]} for r in common],
             "color_identity": "".join(c for c, b in si.COLOR_BITS.items() if identity & b) or "C",
         }
@@ -596,6 +632,7 @@ class CardSearch:
         commander_legal: bool = True,
         sort_reverse: bool = False,
         all_pages: bool = False,
+        collection: Optional[str] = None,
     ) -> Dict:
         """EDHREC's recommended pool for a commander, joined with local card data and filtered."""
         from edhrec import EdhrecError
@@ -609,6 +646,7 @@ class CardSearch:
             types=types, types_none=types_none, color_identity=color_identity,
             mv_min=mv_min, mv_max=mv_max, price_max=price_max, exclude=exclude,
             commander_legal=commander_legal, game_changers=game_changers, filters=filters,
+            collection=collection,
         )
         commanders = []
         for raw in [commander, partner]:
@@ -689,13 +727,18 @@ class CardSearch:
         # MCP callers can request the complete filtered pool in one response.
         # Keep pagination as the default for non-MCP callers.
         selected = rows if all_pages else rows[offset:offset + limit]
+        if collection:
+            self._add_owned(selected, collection)
         return {"page": page, "commanders": commanders, "total": len(rows),
                 "offset": 0 if all_pages else offset, "rows": selected, "notes": notes}
 
     def edhrec_average_deck(self, commander: str, partner: Optional[str] = None,
                             theme: Optional[str] = None, bracket: Optional[str] = None,
-                            budget: Optional[str] = None, refresh: bool = False) -> Dict:
+                            budget: Optional[str] = None, refresh: bool = False,
+                            collection: Optional[str] = None) -> Dict:
         from edhrec import EdhrecError
+
+        owned = self._collection(collection)["cards"] if collection else None
 
         commanders, notes = [], []
         for raw in [commander, partner]:
@@ -726,11 +769,161 @@ class CardSearch:
                 elif not tl_basic:
                     unpriced.append(name)
                 count += qty
-                out.append({"name": name, "qty": qty, "price_eur": price})
+                entry = {"name": name, "qty": qty, "price_eur": price}
+                if owned is not None:
+                    entry["owned"] = owned.get(key, 0) if key else 0
+                out.append(entry)
             priced_sections[section] = out
         deck.update(sections=priced_sections, total_price=total_price, unpriced=unpriced,
                     card_count=count, notes=notes)
+        if owned is not None:
+            entries = [e for cards in priced_sections.values() for e in cards
+                       if e["name"] not in BASIC_LANDS]
+            missing = [e for e in entries if e["owned"] < e["qty"]]
+            deck["collection"] = {
+                "name": self._collection(collection)["name"],
+                "owned": sum(min(e["owned"], e["qty"]) for e in entries),
+                "needed": sum(e["qty"] for e in entries),
+                "missing": [e["name"] for e in missing],
+                "missing_price": sum((e["price_eur"] or 0) * (e["qty"] - e["owned"]) for e in missing),
+            }
         return deck
+
+    # -- collections ----------------------------------------------------------
+
+    def collections(self):
+        """The collection store (created next to the card database on first use)."""
+        if self._collection_store is None:
+            from collection import CollectionStore, COLLECTIONS_FILE
+            self._collection_store = CollectionStore(self._collections_file or COLLECTIONS_FILE)
+        return self._collection_store
+
+    def _collection(self, name: str) -> Dict:
+        """Load a collection into this connection's temp table, refreshing it when it changed."""
+        from collection import CollectionError
+        try:
+            info = self.collections().require(name)
+        except CollectionError as err:
+            raise SearchError(str(err)) from err
+        scope = self._scopes.get(info["name"])
+        if scope is None or scope["token"] != info["updated_at"]:
+            cards = self.collections().cards(info["name"])
+            # TEMP tables work on read-only connections and avoid SQLite's
+            # parameter limit for collections with thousands of cards.
+            self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS collection_scope ("
+                              "collection TEXT NOT NULL, name_normalized TEXT NOT NULL, "
+                              "PRIMARY KEY (collection, name_normalized)) WITHOUT ROWID")
+            with self.conn:
+                self.conn.execute("DELETE FROM temp.collection_scope WHERE collection = ?", (info["name"],))
+                self.conn.executemany("INSERT INTO temp.collection_scope VALUES (?, ?)",
+                                      [(info["name"], k) for k in cards])
+            scope = {"token": info["updated_at"], "cards": cards, "tag_counts": None}
+            self._scopes[info["name"]] = scope
+        return {"name": info["name"], **scope}
+
+    def _collection_clause(self, name: str, column: str = "c.name_normalized"):
+        canonical = self._collection(name)["name"]
+        return (f"{column} IN (SELECT name_normalized FROM temp.collection_scope "
+                f"WHERE collection = ?)", [canonical])
+
+    def _add_owned(self, rows: List[Dict], name: str) -> None:
+        cards = self._collection(name)["cards"]
+        for r in rows:
+            r["owned"] = cards.get(r["name_normalized"], 0)
+
+    def _collection_tag_counts(self, name: str) -> Dict[int, int]:
+        """Distinct cards of a collection per tag (child tags included, like total_count)."""
+        self.require_index(need_tags=True)
+        scope = self._collection(name)
+        if scope["tag_counts"] is None:
+            scope["tag_counts"] = dict(self.conn.execute(
+                "SELECT tc.tag_key, COUNT(DISTINCT c.oracle_id) FROM temp.collection_scope s "
+                "JOIN card_index c ON c.name_normalized = s.name_normalized AND c.is_card = 1 "
+                "JOIN tag_cards tc ON tc.oracle_id = c.oracle_id "
+                "WHERE s.collection = ? GROUP BY tc.tag_key", (scope["name"],)).fetchall())
+            self._scopes[scope["name"]]["tag_counts"] = scope["tag_counts"]
+        return scope["tag_counts"]
+
+    def import_collection(self, name: str, text: Optional[str] = None, path: Optional[str] = None,
+                          mode: str = "replace") -> Dict:
+        """Parse a collection export, resolve names locally and store it under a name."""
+        from collection import CollectionError, parse_collection, read_collection_file
+        self.require_index()
+        if bool(text and text.strip()) == bool(path and path.strip()):
+            raise SearchError("Give exactly one of path (a text/CSV file) or text (the pasted list).")
+        try:
+            source = os.path.abspath(os.path.expanduser(path)) if path else "pasted text"
+            parsed = parse_collection(read_collection_file(path) if path else text)
+            if not parsed.cards:
+                raise CollectionError("No card names found. Expected lines like '2 Sol Ring' "
+                                      "or a CSV export with a Name column.")
+            resolved = self.resolve_names([c["name"] for c in parsed.cards])
+            cards: Dict[str, int] = {}
+            unmatched = [{"name": s["line"], "quantity": None, "reason": s["reason"]}
+                         for s in parsed.skipped]
+            for entry in parsed.cards:
+                key = resolved.get(entry["name"])
+                if key:
+                    cards[key] = cards.get(key, 0) + entry["quantity"]
+                else:
+                    unmatched.append({"name": entry["name"], "quantity": entry["quantity"],
+                                      "reason": "not in the local card database"})
+            info = self.collections().save(name, cards, unmatched, source, mode=mode)
+        except CollectionError as err:
+            raise SearchError(str(err)) from err
+        return {**self.collection_info(info["name"]), "mode": mode,
+                "imported_unique": len(cards), "imported_copies": sum(cards.values()),
+                "imported_unmatched": unmatched}
+
+    def list_collections(self) -> List[Dict]:
+        return self.collections().list()
+
+    def delete_collection(self, name: str) -> str:
+        from collection import CollectionError
+        try:
+            deleted = self.collections().delete(name)
+        except CollectionError as err:
+            raise SearchError(str(err)) from err
+        if self._scopes.pop(deleted, None) is not None:
+            with self.conn:
+                self.conn.execute("DELETE FROM temp.collection_scope WHERE collection = ?", (deleted,))
+        return deleted
+
+    def collection_info(self, name: str) -> Dict:
+        """Size, value, colour identity / card type spread and unmatched lines of a collection."""
+        scope = self._collection(name)
+        info = self.collections().get(scope["name"])
+        cards = scope["cards"]
+        rows = self.conn.execute(
+            "SELECT c.name_normalized, c.color_identity, c.type_line, c.price_eur, c.commander_legal "
+            "FROM temp.collection_scope s JOIN card_index c ON c.name_normalized = s.name_normalized "
+            "WHERE s.collection = ?", (scope["name"],)).fetchall()
+        by_identity: Dict[str, int] = {}
+        by_type: Dict[str, int] = {}
+        value, unpriced, commanders = 0.0, 0, 0
+        for r in rows:
+            identity = r["color_identity"] or "C"
+            by_identity[identity] = by_identity.get(identity, 0) + 1
+            front = (r["type_line"] or "").split("//")[0].lower()
+            for card_type in CARD_TYPES:
+                if card_type.lower() in front:
+                    by_type[card_type] = by_type.get(card_type, 0) + 1
+            if "legendary" in front and "creature" in front and r["commander_legal"]:
+                commanders += 1
+            if r["price_eur"] is None:
+                unpriced += 1
+            else:
+                value += r["price_eur"] * cards.get(r["name_normalized"], 1)
+        order = {c: i for i, c in enumerate("WUBRG")}
+        return {
+            "name": scope["name"], "source": info["source"], "updated_at": info["updated_at"],
+            "unique_cards": len(cards), "copies": sum(cards.values()),
+            "value_eur": value, "unpriced": unpriced, "legendary_creatures": commanders,
+            "by_identity": sorted(by_identity.items(),
+                                  key=lambda x: (x[0] != "C", len(x[0]), [order.get(c, 9) for c in x[0]])),
+            "by_type": [(t, by_type[t]) for t in CARD_TYPES if t in by_type],
+            "unmatched": self.collections().unmatched(scope["name"]),
+        }
 
 
     # -- Comprehensive Rules (read-only; downloading lives in rules.py) -------

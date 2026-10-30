@@ -23,7 +23,10 @@ EXPECTED_TOOLS = {
     'database_status', 'find_tags', 'list_tags', 'search_cards', 'get_cards',
     'card_tags', 'analyze_deck', 'edhrec_recommendations', 'edhrec_average_deck',
     'rules_lookup', 'rules_search', 'rules_glossary',
+    'import_collection', 'list_collections', 'collection_info', 'delete_collection',
 }
+# The only tools that write, and only to collections.db beside the card database.
+WRITE_TOOLS = {'import_collection', 'delete_collection'}
 
 
 class ConfigTests(unittest.TestCase):
@@ -138,13 +141,15 @@ class StdioTests(unittest.TestCase):
                     self.assertEqual(set(tools), EXPECTED_TOOLS)
                     for name, tool in tools.items():
                         self.assertEqual(tool['inputSchema']['type'], 'object')
-                        self.assertTrue(tool['annotations']['readOnlyHint'])
+                        self.assertEqual(tool['annotations']['readOnlyHint'], name not in WRITE_TOOLS)
                         self.assertEqual(tool['annotations']['openWorldHint'], name.startswith('edhrec_'))
                     self.assertEqual(tools['find_tags']['inputSchema']['required'], ['query'])
                     # Nested refinements must be discoverable to both clients,
                     # without adding another search tool or changing old calls.
+                    self.assertTrue(tools['delete_collection']['annotations']['destructiveHint'])
                     for name in ('search_cards', 'edhrec_recommendations'):
                         schema = tools[name]['inputSchema']
+                        self.assertIn('collection', schema['properties'])
                         self.assertIn('filters', schema['properties'])
                         self.assertIn('legalities', json.dumps(schema))
                         self.assertIn('stats', json.dumps(schema))
@@ -169,6 +174,14 @@ class StdioTests(unittest.TestCase):
                     self.assertIn('Minimum mana value', bad_range['content'][0]['text'])
                     self.assertTrue(call('find_tags', {'query': 'ramp', 'limit': 0})['isError'])
                     self.assertIn('Sol Ring', call('search_cards', {'text': 'Sol Ring'})['content'][0]['text'])
+                    export = Path(tmp) / 'my collection.csv'
+                    export.write_text('Count,Name\n3,Sol Ring\n1,Not A Card\n', encoding='utf-8')
+                    imported = call('import_collection', {'name': 'binder', 'path': str(export)})
+                    self.assertIn("Imported 'binder': 1 unique cards", imported['content'][0]['text'])
+                    owned = call('search_cards', {'collection': 'binder', 'text': '"add {C}"'})
+                    self.assertIn('| Sol Ring |', owned['content'][0]['text'])
+                    self.assertIn('| 3 |', owned['content'][0]['text'])
+                    self.assertTrue((Path(tmp) / 'collections.db').exists())
                     resources = request('resources/list')['resources']
                     self.assertIn('rules://comprehensive-rules', [r['uri'] for r in resources])
                     self.assertEqual(db.read_bytes(), original)

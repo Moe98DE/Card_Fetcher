@@ -19,6 +19,7 @@ The GUI's "Codex Setup" and "Claude Setup" buttons generate client-specific
 configuration for the same server. No client-specific protocol mode is needed.
 """
 import argparse
+import os
 import sys
 from typing import Annotated, List, Literal, Optional
 
@@ -33,8 +34,12 @@ try:
     from mcp.types import ToolAnnotations
     READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
     EDHREC_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+    # Collections are the only data this server writes (to collections.db).
+    COLLECTION_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+    COLLECTION_DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                        idempotentHint=True, openWorldHint=False)
 except ImportError:  # very old SDKs
-    READ_ONLY = EDHREC_READ_ONLY = None
+    READ_ONLY = EDHREC_READ_ONLY = COLLECTION_WRITE = COLLECTION_DELETE = None
 
 import search_index as si
 from card_search import CardSearch, SearchError, DEFAULT_DEEP_CUT_RANK, MAX_LIMIT
@@ -91,6 +96,20 @@ fail numeric ranges. Color matching uses WUBRG letters or C. No Scryfall query
 language is parsed; use the named arguments. The same filters object works in
 edhrec_recommendations.
 
+Collections (cards the user owns): import_collection reads a text or CSV
+export from a file path (preferred for large collections) or pasted text and
+stores it under a name. Pass collection="<name>" to search_cards,
+edhrec_recommendations, analyze_deck, find_tags and list_tags to work only
+with owned cards; every other argument (tags, text, filters, sorts) works the
+same, and results show how many copies are owned. Examples: "ramp in BG I
+own" = search_cards(collection=..., tags_any=["ramp"], color_identity="BG");
+specific wording = text='"enters the battlefield" token' (word/phrase search
+over name, type and rules text) or filters.oracle_contains="+1/+1 counter"
+(literal rules-text substring). edhrec_recommendations(collection=...) gives
+EDHREC's picks for a commander that the user already owns;
+edhrec_average_deck(collection=...) shows what is missing and its cost.
+collection_info gives an overview; list_collections names the stored ones.
+
 Prices are the cheapest regular paper EUR price across printings, from the
 last database update. EDHREC pages are cached locally for 7 days.
 """
@@ -102,11 +121,12 @@ _search: Optional[CardSearch] = None
 def engine() -> CardSearch:
     global _search
     if _search is None:
-        import os
         if not os.path.exists(_DB_FILE):
             raise SearchError("No local card database yet. Open MTG Deck Formatter and click "
                               "'Update Local DB'.")
-        _search = CardSearch(si.connect(_DB_FILE, read_only=True))
+        _search = CardSearch(si.connect(_DB_FILE, read_only=True),
+                             collections_file=os.path.join(os.path.dirname(os.path.abspath(_DB_FILE)),
+                                                           "collections.db"))
     return _search
 
 
@@ -152,7 +172,8 @@ def _tag_lines(tags) -> str:
     lines = []
     for t in tags:
         desc = _cell(t["description"], 140)
-        lines.append(f"- `{t['slug']}` ({t['total_count']} cards)" + (f": {desc}" if desc else ""))
+        owned = f"; {t['owned_count']} in collection" if "owned_count" in t else ""
+        lines.append(f"- `{t['slug']}` ({t['total_count']} cards{owned})" + (f": {desc}" if desc else ""))
         if t["children"]:
             kids = ", ".join(t["children"][:12]) + (" …" if len(t["children"]) > 12 else "")
             lines.append(f"  - narrower: {kids}")
@@ -162,6 +183,9 @@ def _tag_lines(tags) -> str:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+CollectionArg = Annotated[Optional[str], Field(description=(
+    "Name of an imported collection (see list_collections). Only cards in it are considered."))]
 
 @_tool()
 @_guard
@@ -189,12 +213,14 @@ def find_tags(
     query: Annotated[str, Field(description="What the card should do, in plain words, e.g. "
                                             "'sacrifice outlet', 'board wipe', 'copy tokens', 'land recursion'.")],
     limit: Annotated[int, Field(ge=1, le=50)] = 15,
+    collection: CollectionArg = None,
 ) -> str:
     """Find Scryfall Tagger oracle tags (functional card tags) matching a need.
 
     Returns tag slugs to use in search_cards, with card counts, descriptions and
-    narrower child tags. Broad tags include all their child tags' cards."""
-    tags = engine().find_tags(query, limit=limit)
+    narrower child tags. Broad tags include all their child tags' cards.
+    With collection, also shows how many of the collection's cards have each tag."""
+    tags = engine().find_tags(query, limit=limit, collection=collection)
     if not tags:
         return f"No tags matched '{query}'. Try other words, list_tags, or search_cards(text=...)."
     return f"Tags matching '{query}':\n" + _tag_lines(tags)
@@ -208,12 +234,16 @@ def list_tags(
     min_cards: Annotated[int, Field(ge=0, description="Hide tags with fewer cards.")] = 0,
     offset: Annotated[int, Field(ge=0)] = 0,
     limit: Annotated[int, Field(ge=1, le=300)] = 100,
+    collection: Annotated[Optional[str], Field(description=(
+        "Only tags that cards in this imported collection have, ordered by how many it has; "
+        "min_cards then counts the collection's cards."))] = None,
 ) -> str:
     """Browse the full catalogue of Scryfall oracle tags (~4,500).
 
     With no arguments, lists top-level tags by size. Use `parent` to drill into a
     tag's children, or `prefix` to see a family of related slugs."""
-    res = engine().list_tags(parent=parent, prefix=prefix, min_cards=min_cards, offset=offset, limit=limit)
+    res = engine().list_tags(parent=parent, prefix=prefix, min_cards=min_cards, offset=offset,
+                             limit=limit, collection=collection)
     out = []
     if res["parent"]:
         p = res["parent"]
@@ -264,10 +294,12 @@ def search_cards(
     filters: Annotated[Optional[CardFilters], Field(description=(
         "Additional refinements; combine with the existing top-level filters. All supplied criteria are ANDed."))] = None,
     sort_reverse: Annotated[bool, Field(description="Reverse the default order for price, mana_value or name; unknown values stay last.")] = False,
+    collection: CollectionArg = None,
 ) -> str:
     """Search local cards by tags, text, identity, mana value, budget and popularity.
 
     Use filters for colors, format legality, keywords, layouts and numeric stats.
+    Use collection to search only cards the user owns.
 
     Returns a compact table (rules text truncated). Use get_cards for full details."""
     res = engine().search_cards(
@@ -276,25 +308,27 @@ def search_cards(
         mv_min=mv_min, mv_max=mv_max, price_max=price_max, rarity=rarity or [], exclude=exclude or [],
         commander_legal=commander_legal, game_changers=game_changers, sort=sort,
         min_edhrec_rank=min_edhrec_rank, max_edhrec_rank=max_edhrec_rank, limit=limit, offset=offset,
-        filters=filters, sort_reverse=sort_reverse,
+        filters=filters, sort_reverse=sort_reverse, collection=collection,
     )
     rows = res["rows"]
     if not rows:
         if res["total"]:
             return f"{res['total']} cards match, but offset={offset} is beyond the last result. Use offset=0 to start again."
-        msg = "No cards matched."
+        msg = "No cards matched" + (f" in collection '{collection}'." if collection else ".")
         if res["notes"]:
             msg += " " + " ".join(res["notes"])
         return msg + " Loosen filters, try broader/parent tags, or a different sort."
 
-    lines = [f"{res['total']} cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).", "",
-             "| Card | Mana | Type | CI | EDHREC | Price | Rules text |",
-             "| --- | --- | --- | --- | ---: | ---: | --- |"]
+    scope = f" in collection '{collection}'" if collection else ""
+    lines = [f"{res['total']} cards match{scope}; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).", "",
+             "| Card | Mana | Type | CI | EDHREC | Price |" + (" Own |" if collection else "") + " Rules text |",
+             "| --- | --- | --- | --- | ---: | ---: |" + (" ---: |" if collection else "") + " --- |"]
     for r in rows:
         name = r["name"] + (" (GC)" if r["game_changer"] else "")
         lines.append("| " + " | ".join([
             _cell(name), _cell(r["mana_cost"]) or "—", _cell(r["type_line"]), r["color_identity"] or "C",
             str(r["edhrec_rank"]) if r["edhrec_rank"] else "—", _price(r["price_eur"]),
+            *([str(r["owned"])] if collection else []),
             _cell(r["oracle_text"], 220),
         ]) + " |")
     if res["total"] > offset + len(rows):
@@ -348,13 +382,17 @@ def card_tags(
 @_tool()
 @_guard
 def analyze_deck(
-    names: Annotated[List[str], Field(description="The decklist's card names (quantities not needed).")],
+    names: Annotated[Optional[List[str]], Field(description="The decklist's card names (quantities not needed).")] = None,
     extra_tags: Annotated[Optional[List[str]], Field(description="Additional tag slugs to count, e.g. the deck's theme.")] = None,
+    collection: Annotated[Optional[str], Field(description=(
+        "Analyse a whole imported collection instead of names: role counts and its most common themes."))] = None,
 ) -> str:
-    """Profile a decklist: colour identity, how many cards fill each core Commander role
+    """Profile a decklist (or a collection): colour identity, how many cards fill each core Commander role
     (ramp, card advantage, removal, board wipes, counterspells, tutors, protection, recursion),
-    and the deck's most frequent functional tags. Use it to spot what the deck is missing."""
-    res = engine().analyze_deck(names, extra_tags=extra_tags or [])
+    and the most frequent functional tags. Use it to spot what the deck is missing."""
+    if bool(names) == bool(collection):
+        return "Error: give either names (a decklist) or collection, not both."
+    res = engine().analyze_deck(names or [], extra_tags=extra_tags or [], collection=collection)
     out = [f"Cards recognised: {res['card_count']} · Colour identity: {res['color_identity']}", "", "**Roles**"]
     for role in res["roles"]:
         listed = ", ".join(role["cards"][:15]) + (" …" if len(role["cards"]) > 15 else "")
@@ -421,6 +459,8 @@ def edhrec_recommendations(
     color_identity: Annotated[Optional[str], Field(description="Optional WUBRG identity or C; subset by default, refined by filters.color_identity_match.")] = None,
     commander_legal: Annotated[bool, Field(description="Only Commander-legal cards unless filters.legalities supplies an explicit Commander status.")] = True,
     sort_reverse: Annotated[bool, Field(description="Reverse this sort's default order (e.g. price: highest first; inclusion: lowest first).")] = False,
+    collection: Annotated[Optional[str], Field(description=(
+        "Only recommendations that are in this imported collection (cards the user owns)."))] = None,
 ) -> str:
     """EDHREC's recommended cards for a commander (optionally a theme, power bracket or budget pool),
     enriched with local mana cost, type, price and rules text, and filterable by Scryfall tags,
@@ -433,7 +473,7 @@ def edhrec_recommendations(
         min_inclusion=min_inclusion, min_synergy=min_synergy, include_lands=include_lands,
         game_changers=game_changers, sort=sort, limit=limit, offset=offset, refresh=refresh,
         filters=filters, color_identity=color_identity, commander_legal=commander_legal,
-        sort_reverse=sort_reverse, all_pages=all_pages,
+        sort_reverse=sort_reverse, all_pages=all_pages, collection=collection,
     )
     page, rows = res["page"], res["rows"]
     offset = res["offset"]
@@ -467,17 +507,20 @@ def edhrec_recommendations(
         if res["total"]:
             out.append(f"{res['total']} recommended cards match, but offset={offset} is beyond the last result. Use offset=0 to start again.")
         else:
-            out.append("No recommended cards match these filters.")
+            out.append("No recommended cards match these filters"
+                       + (f" in collection '{collection}'." if collection else "."))
     else:
-        out.append(f"{res['total']} recommended cards match; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).")
-        out += ["", "| Card | EDHREC list | Incl. | Synergy | Lift | Mana | Type | Price | Rules text |",
-                "| --- | --- | ---: | ---: | ---: | --- | --- | ---: | --- |"]
+        scope = f" in collection '{collection}'" if collection else ""
+        out.append(f"{res['total']} recommended cards match{scope}; showing {offset + 1}-{offset + len(rows)} (sort: {sort}{'; reversed' if sort_reverse else ''}).")
+        out += ["", "| Card | EDHREC list | Incl. | Synergy | Lift | Mana | Type | Price |" + (" Own |" if collection else "") + " Rules text |",
+                "| --- | --- | ---: | ---: | ---: | --- | --- | ---: |" + (" ---: |" if collection else "") + " --- |"]
         for r in rows:
             name = r["name"] + (" (GC)" if r["game_changer"] else "")
             out.append("| " + " | ".join([
                 _cell(name), _cell(r["section"]), _pct(r["inclusion"]), _signed_pct(r["synergy"]),
                 f"{r['lift']:.1f}" if r["lift"] else "—", _cell(r["mana_cost"]) or "—",
                 _cell(r["type_line"]), _price(r["price_eur"]),
+                *([str(r["owned"])] if collection else []),
                 _cell(r["oracle_text"]) if full_text else _cell(r["oracle_text"], 150),
             ]) + " |")
         if res["total"] > offset + len(rows):
@@ -496,21 +539,124 @@ def edhrec_average_deck(
     bracket: Optional[Literal["exhibition", "core", "upgraded", "optimized", "cedh"]] = None,
     budget: Optional[Literal["budget", "expensive"]] = None,
     refresh: bool = False,
+    collection: Annotated[Optional[str], Field(description=(
+        "Compare with this imported collection: owned count, missing cards and their cost."))] = None,
 ) -> str:
     """EDHREC's statistically average 99 for a commander (optionally theme / bracket / budget),
     with local prices. A baseline to improve on, not a finished deck."""
     deck = engine().edhrec_average_deck(commander, partner=partner, theme=theme, bracket=bracket,
-                                        budget=budget, refresh=refresh)
+                                        budget=budget, refresh=refresh, collection=collection)
     out = [f"**{deck['header']}** · {deck['card_count']} cards · ≈€{deck['total_price']:.2f} "
            f"(local prices) · data from {_fetched(deck['fetched_at'])}"]
+    owned = deck.get("collection")
+    if owned:
+        out.append(f"Collection '{owned['name']}': own {owned['owned']}/{owned['needed']} non-basic cards; "
+                   f"missing {len(owned['missing'])} cost ≈€{owned['missing_price']:.2f}.")
     for section, cards in deck["sections"].items():
         out.append(f"\n**{section}** ({sum(c['qty'] for c in cards)})")
         out.append(", ".join((f"{c['qty']}x " if c["qty"] > 1 else "") + c["name"] for c in cards))
+    if owned and owned["missing"]:
+        out.append("\nMissing from collection: " + ", ".join(owned["missing"]))
     if deck["unpriced"]:
         out.append("\nNo local price: " + ", ".join(deck["unpriced"]))
     for note in deck["notes"]:
         out.append(f"Note: {note}")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Collections
+# ---------------------------------------------------------------------------
+
+def _collection_summary(info) -> List[str]:
+    out = [f"**{info['name']}** · {info['unique_cards']} unique cards, {info['copies']} copies · "
+           f"≈€{info['value_eur']:.2f} (local prices"
+           + (f"; {info['unpriced']} cards unpriced" if info["unpriced"] else "") + ")",
+           f"Source: {info['source']}"]
+    if info["by_identity"]:
+        out.append("By colour identity: " + ", ".join(f"{ci} {n}" for ci, n in info["by_identity"]))
+    if info["by_type"]:
+        out.append("By card type: " + ", ".join(f"{t} {n}" for t, n in info["by_type"]))
+    out.append(f"Legendary creatures (possible commanders): {info['legendary_creatures']}")
+    return out
+
+
+def _unmatched_lines(unmatched, limit: int) -> List[str]:
+    if not unmatched:
+        return []
+    out = [f"\nNot imported ({len(unmatched)}):"]
+    for u in unmatched[:limit]:
+        hint = ""
+        if u["reason"] == "not in the local card database":
+            sug = engine().suggest_names(u["name"])
+            hint = f" (similar: {', '.join(sug)})" if sug else ""
+        out.append(f"- {u['name']}" + (f" ×{u['quantity']}" if u["quantity"] else "")
+                   + f": {u['reason']}{hint}")
+    if len(unmatched) > limit:
+        out.append(f"... {len(unmatched) - limit} more (collection_info with show_unmatched for all)")
+    return out
+
+
+@_tool(annotations=COLLECTION_WRITE)
+@_guard
+def import_collection(
+    name: Annotated[str, Field(description="Name to store the collection under, e.g. 'binder' or 'main'.")],
+    path: Annotated[Optional[str], Field(description=(
+        "Absolute path to a text or CSV export on this computer. Preferred for large collections."))] = None,
+    text: Annotated[Optional[str], Field(description="The card list itself, one card per line, e.g. '4 Sol Ring'.")] = None,
+    mode: Annotated[Literal["replace", "add"], Field(description=(
+        "replace: the collection becomes exactly this list. add: merge into an existing collection, adding quantities."))] = "replace",
+) -> str:
+    """Import cards the user owns from a file or pasted text and store them under a name.
+
+    Reads decklist-style lines ('4 Sol Ring', '1 Sol Ring (C21) 263 *F*', Arena/MTGO/Moxfield/Archidekt
+    text) and CSV exports with a Name column (Moxfield, Deckbox, ManaBox, Dragon Shield, ...).
+    Afterwards pass collection=<name> to search_cards, edhrec_recommendations, analyze_deck,
+    find_tags and list_tags to work only with owned cards."""
+    res = engine().import_collection(name, text=text, path=path, mode=mode)
+    verb = "Added to" if mode == "add" else "Imported"
+    out = [f"{verb} '{res['name']}': {res['imported_unique']} unique cards ({res['imported_copies']} copies)"
+           + (f", {len(res['imported_unmatched'])} lines not imported." if res["imported_unmatched"] else "."), ""]
+    out += _collection_summary(res)
+    out += _unmatched_lines(res["imported_unmatched"], 15)
+    out.append(f"\nUse collection=\"{res['name']}\" in search_cards and the other tools.")
+    return "\n".join(out)
+
+
+@_tool()
+@_guard
+def list_collections() -> str:
+    """List the imported collections with their size."""
+    rows = engine().list_collections()
+    if not rows:
+        return "No collections imported yet. Use import_collection with a file path or pasted list."
+    return "\n".join(f"- **{r['name']}**: {r['unique_cards']} unique cards, {r['copies']} copies"
+                     + (f", {r['unmatched']} lines not imported" if r["unmatched"] else "")
+                     + f" (source: {r['source']})" for r in rows)
+
+
+@_tool()
+@_guard
+def collection_info(
+    name: Annotated[str, Field(description="Collection name.")],
+    show_unmatched: Annotated[bool, Field(description="List every line that was not imported.")] = False,
+) -> str:
+    """Overview of an imported collection: size, value, colour identity and card type spread,
+    possible commanders, and lines that could not be imported."""
+    info = engine().collection_info(name)
+    out = _collection_summary(info)
+    out += _unmatched_lines(info["unmatched"], len(info["unmatched"]) if show_unmatched else 10)
+    out.append("\nFor roles and themes use analyze_deck(collection=...); for tags list_tags(collection=...).")
+    return "\n".join(out)
+
+
+@_tool(annotations=COLLECTION_DELETE)
+@_guard
+def delete_collection(
+    name: Annotated[str, Field(description="Collection to delete.")],
+) -> str:
+    """Delete a stored collection (the original file is not touched)."""
+    return f"Deleted collection '{engine().delete_collection(name)}'."
 
 
 # ---------------------------------------------------------------------------

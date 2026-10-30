@@ -89,6 +89,12 @@ What each client gets:
     and glossary definitions. The full text is also exposed as the MCP resource
     `rules://comprehensive-rules`.
 
+-   **Collections (`import_collection`, `list_collections`, `collection_info`,
+    `delete_collection`)**: import the cards you own from a text or CSV file and
+    pass `collection="<name>"` to `search_cards`, `edhrec_recommendations`,
+    `analyze_deck`, `find_tags` and `list_tags` to work only with owned cards.
+    See [Searching your collection](#searching-your-collection).
+
 The rules are only ever downloaded by you: click **Update Rules** (leave the URL
 empty to fetch the newest `.txt` from magic.wizards.com/rules, paste a direct
 link, or import a local file), or run `python rules.py [url-or-file]`. The file
@@ -99,6 +105,39 @@ EDHREC has no official API; the tool requests only the page for the commander
 you name, the same JSON the EDHREC website loads, and caches it for 7 days in
 `edhrec_cache.db` next to the card database. Repeat requests are offline, and if
 EDHREC is unreachable an older cached copy is used. The server performs these requests; the client does not need a browser tool.
+
+### Searching your collection
+
+Ask the assistant to import your collection, e.g. *"import my collection from
+C:\Users\me\Downloads\moxfield_haves.csv as 'binder'"*. `import_collection`
+reads the file itself (give an absolute path) or accepts a pasted list:
+
+-   Decklist-style text: `4 Sol Ring`, `1x Sol Ring (C21) 263 *F*`, and the
+    Arena, MTGO, Moxfield and Archidekt text exports the GUI already reads.
+-   CSV exports with a header row containing a `Name` (or `Card Name`) column and
+    optionally `Count` / `Quantity` (Moxfield, Deckbox, ManaBox, Dragon Shield ...).
+
+Rows for the same card (different printings, foils) are merged and their
+quantities added. Names that are not in the local database are listed with
+spelling suggestions. `mode="add"` merges another file into an existing
+collection; the default `replace` overwrites it. Collections are stored by name
+in `collections.db` next to the card database, so they survive restarts; the
+card database itself stays read-only.
+
+Then add `collection="binder"` to the usual tools. Every other argument keeps
+its meaning, so tags, text search and `filters` work on owned cards:
+
+| Goal | Call |
+| --- | --- |
+| Ramp in Golgari colours I own | `search_cards(collection="binder", tags_any=["ramp"], color_identity="BG")` |
+| Owned cards with specific wording | `search_cards(collection="binder", text='"enters the battlefield" token')` or `filters={"oracle_contains": "+1/+1 counter"}` |
+| Which tags / themes my collection covers | `list_tags(collection="binder")`, `find_tags("sacrifice outlet", collection="binder")`, `analyze_deck(collection="binder")` |
+| EDHREC picks for a commander that I own | `edhrec_recommendations("Korvold", collection="binder")` |
+| What I'd need to buy for the average deck | `edhrec_average_deck("Korvold", collection="binder")` |
+
+Results include an **Own** column with the number of copies. `collection_info`
+summarises size, value, colour identity and card type spread, and possible
+commanders.
 
 ### Composing detailed card queries
 
@@ -306,6 +345,7 @@ The application is designed to be modular and scalable:
 -   `api_client.py`: Manages all communication with the external Scryfall API.
 -   `models.py`: Defines the `Card` data structure, decoupling the app from the specific API response format.
 -   `formatter.py`: Handles the presentation logic, turning structured `Card` data into a clean, formatted string.
+-   `collection.py`: Parses collection exports (text and CSV) and stores named collections for the MCP tools.
 
 ## Dependencies
 
